@@ -89,6 +89,9 @@ enum PrimCommand {
         /// Optional attribute entries in key=value form
         #[arg(long = "attr", value_name = "KEY=VALUE")]
         attrs: Vec<String>,
+        /// Declared effect CIDs
+        #[arg(long = "effect", value_name = "CID")]
+        effects: Vec<String>,
         /// Skip name_index registration
         #[arg(long = "no-register")]
         no_register: bool,
@@ -209,6 +212,9 @@ enum WordCommand {
         params: Vec<String>,
         #[arg(long = "result", value_name = "TYPE")]
         results: Vec<String>,
+        /// Declared effect CIDs
+        #[arg(long = "effect", value_name = "CID")]
+        effects: Vec<String>,
         #[arg(long = "no-register")]
         no_register: bool,
     },
@@ -293,12 +299,14 @@ fn cmd_prim(store: &Path, command: PrimCommand) -> Result<()> {
             params,
             results,
             attrs,
+            effects,
             no_register,
         } => {
             let conn = open_store(store)?;
             let attrs_pairs = parse_attrs(&attrs)?;
             let param_tags = parse_type_tags(&params)?;
             let result_tags = parse_type_tags(&results)?;
+            let effect_cids = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let attr_refs: Vec<(&str, &str)> = attrs_pairs
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -307,6 +315,7 @@ fn cmd_prim(store: &Path, command: PrimCommand) -> Result<()> {
                 params: &param_tags,
                 results: &result_tags,
                 attrs: &attr_refs,
+                effects: effect_cids.as_slice(),
             };
             let outcome = prim::store_prim(&conn, &spec)?;
             if !no_register {
@@ -500,6 +509,7 @@ fn cmd_word(store: &Path, command: WordCommand) -> Result<()> {
             root,
             params,
             results,
+            effects,
             no_register,
         } => {
             let conn = open_store(store)?;
@@ -508,6 +518,7 @@ fn cmd_word(store: &Path, command: WordCommand) -> Result<()> {
                 root: root_cid,
                 params,
                 results,
+                effects: parse_cid_list(effects.iter().map(|s| s.as_str()))?,
             };
             let outcome = word::store_word(&conn, &word)?;
             if !no_register {

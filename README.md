@@ -32,7 +32,8 @@ Register a primitive descriptor (including optional attributes and automatic nam
 target/release/march5 --db demo.march5.db prim add add_i64 \
   --param i64 --param i64 \
   --result i64 \
-  --attr category=arith --attr commutative=true
+  --attr category=arith --attr commutative=true \
+  --effect 9545e3adf7a49fb36233ec4555d0763b694ac65330ffb412a1c438d8ebde09ec
 ```
 
 By default the CLI persists the primitive object and records the name in the `name_index` under the `prim` scope.
@@ -74,7 +75,8 @@ target/release/march5 --db demo.march5.db word add \
   --name demo.math/difference \
   --root <root_cid> \
   --param i64 --param i64 \
-  --result i64
+  --result i64 \
+  --effect 9545e3adf7a49fb36233ec4555d0763b694ac65330ffb412a1c438d8ebde09ec
 ```
 
 Replace `<root_cid>` with the 64-digit hex CID emitted when creating the root node.

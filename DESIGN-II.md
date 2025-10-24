@@ -225,3 +225,133 @@ If a dependency changes implementation but preserves the same interface CID, the
 
 Lockfiles improve reproducibility and prevent silent provider substitution.
 
+## Effects, Interfaces, Namespaces — Responsibilities & Boundaries
+
+### What each thing is
+
+- **Namespace** (compile-time, CID’d object)
+  - Groups words (exports) and declares external **bindings** (required interfaces).
+  - Canonical fields: `bindings`, `exports`, `interface`.
+  - Human **names** and `use` aliases are non-canonical metadata.
+
+- **Interface** (compile-time, CID’d object)
+  - The **contract** a namespace promises: for each exported symbol, its **name**, **type signature**, and **effect set**.
+  - Canonical fields: `symbols` (sorted).
+  - Hash of the canonical encoding = **interface CID**.
+
+- **Effects** (semantic capability labels)
+  - Describe what a word can do besides pure computation (e.g., `io`, `heap`, `clock`, `net`, `random`, `gpu`, `ffi`).
+  - Appear:
+    - in **interface** entries (each symbol’s `effects`),
+    - in **node** objects (`effects` array) so schedulers/JIT can serialize side effects.
+
+### Why they are separate
+
+- Namespaces = organization & exports.  
+- Interfaces = structural API identity (for compatibility & substitutability).  
+- Effects = semantic constraints (purity, permissions, scheduling).
+
+### Binding rule
+
+A namespace’s `bindings` is the set of **interface CIDs** it requires.  
+It is **not** a list of specific symbol→CID pairs. Symbol-level identity already lives inside graphs as `NodePayload::Word(wordCID)`.
+
+### Source-to-store flow
+
+1. Author writes code, optionally with `use` aliases (non-canonical).
+2. Resolver maps references to exported **word CIDs** and notes external providers.
+3. Builder constructs the namespace’s **interface** by listing each exported symbol: `(name, type, effects)`.
+4. Namespace `bindings` = the set of **interface CIDs** of all external providers used.
+5. Persist:
+   - `interface` object → **interface CID**,
+   - `namespace` object → **namespace CID**.
+
+### Validation
+
+- Interface `symbols` are sorted by `name`; each symbol encodes:
+  - `params` (type tags),
+  - `results` (type tags),
+  - `effects` (sorted list of effect IDs; see encoding below).
+- Namespace:
+  - `bindings` is a sorted, deduped list of `{ interface: <cid> }`.
+  - `exports` is sorted by `name`.
+
+---
+
+## Interface Encoding — Canonical & Compact
+
+The readable JSON you’ve seen is for docs. On the wire we use a **compact, deterministic CBOR** with short keys and arrays to avoid repetition.
+
+### Type tags
+Use a tiny enum (atoms), not freeform strings:
+- `i64`, `f64`, `ptr`, `unit`, `str`, …
+
+### Effects
+Effects are identity-bearing. Use **effect CIDs** (32-byte) in canonical form (sorted).  
+(If you later standardize a small core set, you can map well-known effect CIDs to 1-byte codes in encoding, without changing semantics.)
+
+### Canonical key order
+- Interface object keys in this exact order: `kind`, `symbols`.
+- Symbol entries use arrays (no per-entry key repetition).
+
+### Canonical interface (compact form)
+
+Readable shape:
+  kind = "interface"
+  symbols = [
+    // each symbol is: [ name, params[], results[], effects[] ]
+    [ "print", ["str"], ["unit"], [ <ioEffectCID> ] ],
+    [ "read",  [],      ["str"],  [ <ioEffectCID> ] ]
+  ]
+
+CBOR-friendly shape (pseudocode):
+  {
+    "kind": "interface",
+    "symbols": [
+      [ text(name), array(param_type_atoms), array(result_type_atoms), array(effectCIDs) ],
+      ...
+    ]
+  }
+
+Notes:
+- `symbols` sorted by `name`.
+- `effects` sorted lexicographically by CID bytes.
+- Omit nothing inside symbol entries (always 4 items) for stable layout.
+
+### Example (human-readable, compact)
+
+  {
+    "kind": "interface",
+    "symbols": [
+      [ "print", ["str"], ["unit"], [ "EFFECT:IO:CID" ] ],
+      [ "read",  [],      ["str"],  [ "EFFECT:IO:CID" ] ]
+    ]
+  }
+
+Hash the CBOR bytes → **interface CID**.
+
+This keeps identity precise, while the encoding is small and consistent.
+
+---
+
+## Why not a string-inflated map per symbol?
+
+Maps would repeat keys (`"name"`, `"type"`, `"effects"`) for every symbol.  
+Array entries avoid that repetition, speed up parsing, and reduce hashing ambiguity.
+
+---
+
+## Practical loader tips
+
+- Validate determinism: reject unsorted `symbols` or `effects`.
+- Keep a tiny table mapping type atoms (`"i64"`, `"str"`, …) → `TypeTag` enum at load time.
+- Effects in RAM can be a **bitmask** for scheduling, but the canonical object stores the **CIDs**. The bit positions should be derived from a stable, global mapping (e.g., ordered by effect CID).
+
+---
+
+## Future extensions (won’t break CIDs if added as new kinds)
+
+- Add an optional, non-canonical `"doc"` field for documentation (ignored for hashing).
+- Add an optional `"deprecations"` side table (non-canonical).
+- Add `"symbols_ext"` with extra metadata; keep `"symbols"` as the canonical core.
+

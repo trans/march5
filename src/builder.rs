@@ -3,9 +3,10 @@
 //! The builder maintains a stack of `(cid, port, type)` pairs, seeds `ARG`
 //! nodes for parameters, and materialises `node`/`word` objects on demand.
 //! It uses compact `TypeTag` enums to avoid string drift and keeps track of
-//! wiring-only stack operations (`dup`, `swap`, `over`).
+//! wiring-only stack operations (`dup`, `swap`, `over`). Declared effects from
+//! primitives and words are accumulated so resulting nodes inherit effect sets.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
@@ -14,7 +15,7 @@ use crate::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use crate::prim::{self, PrimInfo};
 use crate::store;
 use crate::types::TypeTag;
-use crate::word::{self, WordCanon};
+use crate::word::{self, WordCanon, WordInfo};
 
 /// Stack items track the producer CID, output port, and type.
 #[derive(Clone, Debug)]
@@ -30,6 +31,8 @@ pub struct GraphBuilder<'conn> {
     stack: Vec<StackItem>,
     param_types: Vec<TypeTag>,
     prim_cache: HashMap<[u8; 32], PrimInfo>,
+    word_cache: HashMap<[u8; 32], WordInfo>,
+    accumulated_effects: BTreeSet<[u8; 32]>,
 }
 
 impl<'conn> GraphBuilder<'conn> {
@@ -40,6 +43,8 @@ impl<'conn> GraphBuilder<'conn> {
             stack: Vec::new(),
             param_types: Vec::new(),
             prim_cache: HashMap::new(),
+            word_cache: HashMap::new(),
+            accumulated_effects: BTreeSet::new(),
         }
     }
 
@@ -47,6 +52,7 @@ impl<'conn> GraphBuilder<'conn> {
     pub fn begin_word(&mut self, params: &[TypeTag]) -> Result<()> {
         self.stack.clear();
         self.param_types = params.to_vec();
+        self.accumulated_effects.clear();
 
         for (idx, ty) in params.iter().enumerate() {
             let node = NodeCanon {
@@ -174,6 +180,9 @@ impl<'conn> GraphBuilder<'conn> {
             payload: NodePayload::Prim(prim_cid),
         };
         let outcome = node::store_node(self.conn, &node)?;
+        for effect in &info.effects {
+            self.accumulated_effects.insert(*effect);
+        }
         self.stack.push(StackItem {
             cid: outcome.cid,
             port: 0,
@@ -182,14 +191,10 @@ impl<'conn> GraphBuilder<'conn> {
         Ok(outcome.cid)
     }
 
-    /// Apply a word call given parameter/result type metadata.
-    pub fn apply_word(
-        &mut self,
-        word_cid: [u8; 32],
-        param_tys: &[TypeTag],
-        result_tys: &[TypeTag],
-    ) -> Result<[u8; 32]> {
-        let arity = param_tys.len();
+    /// Apply a word call using metadata loaded from storage.
+    pub fn apply_word(&mut self, word_cid: [u8; 32]) -> Result<[u8; 32]> {
+        let info = self.word_info(&word_cid)?;
+        let arity = info.params.len();
         if self.stack.len() < arity {
             bail!(
                 "stack underflow: call needs {arity} values, have {}",
@@ -203,7 +208,7 @@ impl<'conn> GraphBuilder<'conn> {
         }
         popped.reverse();
 
-        for (i, (expected, actual)) in param_tys.iter().zip(popped.iter()).enumerate() {
+        for (i, (expected, actual)) in info.params.iter().zip(popped.iter()).enumerate() {
             if expected != &actual.ty {
                 bail!(
                     "call argument {i} type mismatch: expected {:?}, got {:?}",
@@ -221,7 +226,8 @@ impl<'conn> GraphBuilder<'conn> {
             })
             .collect();
 
-        let out_ty = result_tys
+        let out_ty = info
+            .results
             .get(0)
             .copied()
             .ok_or_else(|| anyhow!("callee must produce at least one result"))?;
@@ -230,11 +236,13 @@ impl<'conn> GraphBuilder<'conn> {
             kind: NodeKind::Call,
             ty: out_ty.as_atom().to_string(),
             inputs,
-            // TODO: attach effects once word metadata tracks them.
-            effects: Vec::new(),
+            effects: info.effects.clone(),
             payload: NodePayload::Word(word_cid),
         };
         let outcome = node::store_node(self.conn, &node)?;
+        for effect in &info.effects {
+            self.accumulated_effects.insert(*effect);
+        }
         self.stack.push(StackItem {
             cid: outcome.cid,
             port: 0,
@@ -306,6 +314,7 @@ impl<'conn> GraphBuilder<'conn> {
             root: root.cid,
             params: params.iter().map(|t| t.as_atom().to_string()).collect(),
             results: results.iter().map(|t| t.as_atom().to_string()).collect(),
+            effects: self.accumulated_effects.iter().copied().collect(),
         };
         let outcome = word::store_word(self.conn, &word)?;
         if let Some(name) = symbol {
@@ -314,6 +323,7 @@ impl<'conn> GraphBuilder<'conn> {
 
         // Leave the final result on the stack for inspection, but reset param tracking.
         self.param_types.clear();
+        self.accumulated_effects.clear();
         Ok(outcome.cid)
     }
 
@@ -323,6 +333,15 @@ impl<'conn> GraphBuilder<'conn> {
         }
         let info = prim::load_prim_info(self.conn, cid)?;
         self.prim_cache.insert(*cid, info.clone());
+        Ok(info)
+    }
+
+    fn word_info(&mut self, cid: &[u8; 32]) -> Result<WordInfo> {
+        if let Some(info) = self.word_cache.get(cid) {
+            return Ok(info.clone());
+        }
+        let info = word::load_word_info(self.conn, cid)?;
+        self.word_cache.insert(*cid, info.clone());
         Ok(info)
     }
 }
@@ -344,6 +363,7 @@ mod tests {
             params: &param_tags,
             results: &result_tags,
             attrs: &[],
+            effects: &[],
         };
         let prim_outcome = prim::store_prim(&conn, &prim)?;
 

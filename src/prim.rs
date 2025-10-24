@@ -1,10 +1,10 @@
 //! Canonical encoding, storage, and metadata helpers for primitive descriptors.
 
-use std::cmp::Ordering;
-
 use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
 use serde::Deserialize;
+use serde_bytes::ByteBuf;
+use std::cmp::Ordering;
 
 use crate::cbor::{push_map, push_text};
 use crate::types::{TypeTag, encode_type_signature};
@@ -18,6 +18,8 @@ pub struct PrimCanon<'a> {
     pub results: &'a [TypeTag],
     /// Optional key/value attribute pairs (sorted before encoding).
     pub attrs: &'a [(&'a str, &'a str)],
+    /// Declared effect CIDs (unordered; will be sorted during encoding).
+    pub effects: &'a [[u8; 32]],
 }
 
 /// Result of persisting a primitive descriptor.
@@ -40,7 +42,14 @@ pub struct PrimInfo {
 pub fn encode(prim: &PrimCanon) -> Vec<u8> {
     let mut buf = Vec::new();
     let has_attrs = !prim.attrs.is_empty();
-    let map_len = if has_attrs { 3 } else { 2 };
+    let has_effects = !prim.effects.is_empty();
+    let mut map_len = 2;
+    if has_attrs {
+        map_len += 1;
+    }
+    if has_effects {
+        map_len += 1;
+    }
     push_map(&mut buf, map_len);
 
     push_text(&mut buf, "kind");
@@ -54,6 +63,11 @@ pub fn encode(prim: &PrimCanon) -> Vec<u8> {
     if has_attrs {
         push_text(&mut buf, "attrs");
         encode_attrs(&mut buf, prim.attrs);
+    }
+
+    if has_effects {
+        push_text(&mut buf, "effects");
+        encode_effects(&mut buf, prim.effects);
     }
 
     buf
@@ -92,10 +106,26 @@ pub fn load_prim_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<PrimInf
         .map(|s| TypeTag::from_atom(s))
         .collect::<Result<Vec<_>>>()?;
     // TODO: surface declared effects once encoded.
+    let effects = record
+        .effects
+        .unwrap_or_default()
+        .into_iter()
+        .map(|bytes| {
+            let slice = bytes.as_ref();
+            if slice.len() != 32 {
+                bail!("invalid effect CID length in prim object: {}", slice.len());
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(slice);
+            Ok(arr)
+        })
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| "failed to parse prim effects")?;
+
     Ok(PrimInfo {
         params,
         results,
-        effects: Vec::new(),
+        effects,
     })
 }
 
@@ -113,11 +143,22 @@ fn encode_attrs(buf: &mut Vec<u8>, attrs: &[(&str, &str)]) {
     }
 }
 
+fn encode_effects(buf: &mut Vec<u8>, effects: &[[u8; 32]]) {
+    let mut sorted = effects.to_vec();
+    sorted.sort();
+    crate::cbor::push_array(buf, sorted.len() as u64);
+    for effect in sorted {
+        crate::cbor::push_bytes(buf, &effect);
+    }
+}
+
 #[derive(Deserialize)]
 struct PrimRecord {
     kind: String,
     #[serde(rename = "type")]
     ty: PrimTypeRecord,
+    #[serde(default)]
+    effects: Option<Vec<ByteBuf>>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +180,7 @@ mod tests {
             params: &params,
             results: &results,
             attrs: &[],
+            effects: &[],
         };
         let encoded = encode(&prim);
         assert_eq!(
@@ -164,6 +206,7 @@ mod tests {
             params: &params,
             results: &results,
             attrs: &attrs,
+            effects: &[],
         };
         let encoded = encode(&prim);
         // The attrs map must be sorted lexicographically by key, then value.
@@ -192,6 +235,7 @@ mod tests {
             params: &params,
             results: &results,
             attrs: &[],
+            effects: &[],
         };
         let outcome = store_prim(&conn, &prim)?;
         let info = load_prim_info(&conn, &outcome.cid)?;
