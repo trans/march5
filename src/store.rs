@@ -98,3 +98,11 @@ pub fn put_object(conn: &Connection, cid: &[u8; 32], kind: &str, cbor: &[u8]) ->
     )?;
     Ok(rows > 0)
 }
+
+pub fn put_name(conn: &Connection, scope: &str, name: &str, cid: &[u8; 32]) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO name_index (scope, name, cid) VALUES (?1, ?2, ?3)",
+        params![scope, name, &cid[..]],
+    )?;
+    Ok(())
+}

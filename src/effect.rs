@@ -1,8 +1,8 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::cid;
-use crate::store;
+use crate::cbor::{push_map, push_text};
+use crate::{cid, store};
 
 pub struct EffectCanon<'a> {
     pub name: &'a str,
@@ -17,7 +17,7 @@ pub struct EffectStoreOutcome {
 pub fn encode(effect: &EffectCanon) -> Vec<u8> {
     let mut buf = Vec::new();
     let map_len = if effect.doc.is_some() { 3 } else { 2 };
-    push_header(&mut buf, 5, map_len);
+    push_map(&mut buf, map_len);
 
     push_text(&mut buf, "kind");
     push_text(&mut buf, "effect");
@@ -38,35 +38,6 @@ pub fn store_effect(conn: &Connection, effect: &EffectCanon) -> Result<EffectSto
     let cid = cid::compute(&cbor);
     let inserted = store::put_object(conn, &cid, "effect", &cbor)?;
     Ok(EffectStoreOutcome { cid, inserted })
-}
-
-fn push_text(buf: &mut Vec<u8>, text: &str) {
-    let bytes = text.as_bytes();
-    push_header(buf, 3, bytes.len() as u64);
-    buf.extend_from_slice(bytes);
-}
-
-fn push_header(buf: &mut Vec<u8>, major: u8, len: u64) {
-    assert!(major < 8);
-    match len {
-        0..=23 => buf.push((major << 5) | (len as u8)),
-        24..=0xff => {
-            buf.push((major << 5) | 24);
-            buf.push(len as u8);
-        }
-        0x100..=0xffff => {
-            buf.push((major << 5) | 25);
-            buf.extend_from_slice(&(len as u16).to_be_bytes());
-        }
-        0x1_0000..=0xffff_ffff => {
-            buf.push((major << 5) | 26);
-            buf.extend_from_slice(&(len as u32).to_be_bytes());
-        }
-        _ => {
-            buf.push((major << 5) | 27);
-            buf.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-    }
 }
 
 #[cfg(test)]
