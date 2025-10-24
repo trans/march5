@@ -1,11 +1,16 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use clap::{Parser, Subcommand};
+use rusqlite::Connection;
 
 use march5::effect::{self, EffectCanon};
+use march5::iface::{self, IfaceCanon, IfaceSymbol};
+use march5::namespace::{self, NamespaceCanon};
+use march5::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use march5::prim::{self, PrimCanon};
-use march5::{cid, create_store, derive_db_path, open_store, put_name};
+use march5::word::{self, WordCanon};
+use march5::{TypeTag, cid, create_store, derive_db_path, open_store, put_name};
 
 #[derive(Parser)]
 #[command(name = "march5", version, about = "March α₅ CLI tooling")]
@@ -34,6 +39,26 @@ enum Command {
     Prim {
         #[command(subcommand)]
         command: PrimCommand,
+    },
+    /// Manage interface descriptors
+    Iface {
+        #[command(subcommand)]
+        command: IfaceCommand,
+    },
+    /// Manage namespaces
+    Namespace {
+        #[command(subcommand)]
+        command: NamespaceCommand,
+    },
+    /// Manage graph nodes
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
+    },
+    /// Manage words (graph entrypoints)
+    Word {
+        #[command(subcommand)]
+        command: WordCommand,
     },
 }
 
@@ -70,6 +95,130 @@ enum PrimCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum IfaceCommand {
+    /// Insert or update an interface descriptor
+    Add {
+        /// Optional human/name-index entry
+        #[arg(long = "name")]
+        name: Option<String>,
+        /// Symbol specifications of the form `symbol(param,...) -> result,... | effectCID,...`
+        #[arg(long = "symbol", required = true, value_name = "SPEC")]
+        symbols: Vec<String>,
+        /// Skip name_index registration
+        #[arg(long = "no-register")]
+        no_register: bool,
+    },
+    /// List registered interface names
+    List {
+        #[arg(long = "prefix")]
+        prefix: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NamespaceCommand {
+    /// Insert or update a namespace descriptor
+    Add {
+        /// Optional namespace name for name_index registration
+        #[arg(long = "name")]
+        name: Option<String>,
+        /// Interface CID satisfied by this namespace
+        #[arg(long = "iface")]
+        iface: String,
+        /// Required interface CIDs for imports
+        #[arg(long = "import", value_name = "CID")]
+        imports: Vec<String>,
+        /// Exported word CIDs
+        #[arg(long = "export", value_name = "CID")]
+        exports: Vec<String>,
+        /// Skip name registration
+        #[arg(long = "no-register")]
+        no_register: bool,
+    },
+    /// List registered namespaces
+    List {
+        #[arg(long = "prefix")]
+        prefix: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// Insert a literal node (currently supports i64 literals)
+    Lit {
+        #[arg(long = "ty")]
+        ty: String,
+        #[arg(long = "value")]
+        value: i64,
+        #[arg(long = "effect")]
+        effects: Vec<String>,
+    },
+    /// Insert a primitive node
+    Prim {
+        #[arg(long = "ty")]
+        ty: String,
+        #[arg(long = "prim")]
+        prim: String,
+        #[arg(long = "input", value_name = "CID:PORT")]
+        inputs: Vec<String>,
+        #[arg(long = "effect")]
+        effects: Vec<String>,
+    },
+    /// Insert a call node referencing a word CID
+    Call {
+        #[arg(long = "ty")]
+        ty: String,
+        #[arg(long = "word")]
+        word: String,
+        #[arg(long = "input", value_name = "CID:PORT")]
+        inputs: Vec<String>,
+        #[arg(long = "effect")]
+        effects: Vec<String>,
+    },
+    /// Insert an argument node (ARG)
+    Arg {
+        #[arg(long = "ty")]
+        ty: String,
+        #[arg(long = "index")]
+        index: u32,
+        #[arg(long = "effect")]
+        effects: Vec<String>,
+    },
+    /// Insert a load-global node
+    LoadGlobal {
+        #[arg(long = "ty")]
+        ty: String,
+        #[arg(long = "global")]
+        global: String,
+        #[arg(long = "effect")]
+        effects: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum WordCommand {
+    /// Insert or update a word descriptor
+    Add {
+        /// Optional human/name-index entry (e.g. namespace/foo)
+        #[arg(long = "name")]
+        name: Option<String>,
+        #[arg(long = "root")]
+        root: String,
+        #[arg(long = "param", value_name = "TYPE")]
+        params: Vec<String>,
+        #[arg(long = "result", value_name = "TYPE")]
+        results: Vec<String>,
+        #[arg(long = "no-register")]
+        no_register: bool,
+    },
+    /// List registered words (optionally filtered by prefix)
+    List {
+        #[arg(long = "prefix")]
+        prefix: Option<String>,
+    },
+}
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("error: {err}");
@@ -89,6 +238,22 @@ fn run() -> Result<()> {
         Command::Prim { command } => {
             let store_path = require_store_path(cli.store.as_deref())?;
             cmd_prim(store_path, command)
+        }
+        Command::Iface { command } => {
+            let store_path = require_store_path(cli.store.as_deref())?;
+            cmd_iface(store_path, command)
+        }
+        Command::Namespace { command } => {
+            let store_path = require_store_path(cli.store.as_deref())?;
+            cmd_namespace(store_path, command)
+        }
+        Command::Node { command } => {
+            let store_path = require_store_path(cli.store.as_deref())?;
+            cmd_node(store_path, command)
+        }
+        Command::Word { command } => {
+            let store_path = require_store_path(cli.store.as_deref())?;
+            cmd_word(store_path, command)
         }
     }
 }
@@ -132,15 +297,15 @@ fn cmd_prim(store: &Path, command: PrimCommand) -> Result<()> {
         } => {
             let conn = open_store(store)?;
             let attrs_pairs = parse_attrs(&attrs)?;
-            let param_refs: Vec<&str> = params.iter().map(|s| s.as_str()).collect();
-            let result_refs: Vec<&str> = results.iter().map(|s| s.as_str()).collect();
+            let param_tags = parse_type_tags(&params)?;
+            let result_tags = parse_type_tags(&results)?;
             let attr_refs: Vec<(&str, &str)> = attrs_pairs
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
             let spec = PrimCanon {
-                params: &param_refs,
-                results: &result_refs,
+                params: &param_tags,
+                results: &result_tags,
                 attrs: &attr_refs,
             };
             let outcome = prim::store_prim(&conn, &spec)?;
@@ -153,6 +318,213 @@ fn cmd_prim(store: &Path, command: PrimCommand) -> Result<()> {
             } else {
                 println!("prim `{name}` already present with cid {cid_hex}");
             }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_iface(store: &Path, command: IfaceCommand) -> Result<()> {
+    match command {
+        IfaceCommand::Add {
+            name,
+            symbols,
+            no_register,
+        } => {
+            let conn = open_store(store)?;
+            let mut parsed = Vec::with_capacity(symbols.len());
+            for spec in symbols {
+                parsed.push(parse_iface_symbol(&spec)?);
+            }
+            let iface = IfaceCanon { symbols: parsed };
+            let outcome = iface::store_iface(&conn, &iface)?;
+            if !no_register {
+                if let Some(name) = &name {
+                    put_name(&conn, "iface", name, &outcome.cid)?;
+                }
+            }
+            let cid_hex = cid::to_hex(&outcome.cid);
+            if outcome.inserted {
+                println!("stored iface with cid {cid_hex}");
+            } else {
+                println!("iface already present with cid {cid_hex}");
+            }
+        }
+        IfaceCommand::List { prefix } => {
+            let conn = open_store(store)?;
+            list_scope(
+                &conn,
+                "iface",
+                prefix.as_deref(),
+                "no interfaces registered",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_namespace(store: &Path, command: NamespaceCommand) -> Result<()> {
+    match command {
+        NamespaceCommand::Add {
+            name,
+            iface,
+            imports,
+            exports,
+            no_register,
+        } => {
+            let conn = open_store(store)?;
+            let iface_cid = cid::from_hex(&iface)?;
+            let imports = parse_cid_list(imports.iter().map(|s| s.as_str()))?;
+            let exports = parse_cid_list(exports.iter().map(|s| s.as_str()))?;
+            let ns = NamespaceCanon {
+                imports,
+                exports,
+                iface: iface_cid,
+            };
+            let outcome = namespace::store_namespace(&conn, &ns)?;
+            if !no_register {
+                if let Some(name) = &name {
+                    put_name(&conn, "namespace", name, &outcome.cid)?;
+                }
+            }
+            let cid_hex = cid::to_hex(&outcome.cid);
+            if outcome.inserted {
+                println!("stored namespace with cid {cid_hex}");
+            } else {
+                println!("namespace already present with cid {cid_hex}");
+            }
+        }
+        NamespaceCommand::List { prefix } => {
+            let conn = open_store(store)?;
+            list_scope(
+                &conn,
+                "namespace",
+                prefix.as_deref(),
+                "no namespaces registered",
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
+    let conn = open_store(store)?;
+    let outcome = match command {
+        NodeCommand::Lit { ty, value, effects } => {
+            let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
+            let node = NodeCanon {
+                kind: NodeKind::Lit,
+                ty,
+                inputs: Vec::new(),
+                effects,
+                payload: NodePayload::LitI64(value),
+            };
+            node::store_node(&conn, &node)?
+        }
+        NodeCommand::Prim {
+            ty,
+            prim,
+            inputs,
+            effects,
+        } => {
+            let prim_cid = cid::from_hex(&prim)?;
+            let inputs = parse_inputs(&inputs)?;
+            let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
+            let node = NodeCanon {
+                kind: NodeKind::Prim,
+                ty,
+                inputs,
+                effects,
+                payload: NodePayload::Prim(prim_cid),
+            };
+            node::store_node(&conn, &node)?
+        }
+        NodeCommand::Call {
+            ty,
+            word,
+            inputs,
+            effects,
+        } => {
+            let word_cid = cid::from_hex(&word)?;
+            let inputs = parse_inputs(&inputs)?;
+            let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
+            let node = NodeCanon {
+                kind: NodeKind::Call,
+                ty,
+                inputs,
+                effects,
+                payload: NodePayload::Word(word_cid),
+            };
+            node::store_node(&conn, &node)?
+        }
+        NodeCommand::Arg { ty, index, effects } => {
+            let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
+            let node = NodeCanon {
+                kind: NodeKind::Arg,
+                ty,
+                inputs: Vec::new(),
+                effects,
+                payload: NodePayload::Arg(index),
+            };
+            node::store_node(&conn, &node)?
+        }
+        NodeCommand::LoadGlobal {
+            ty,
+            global,
+            effects,
+        } => {
+            let global_cid = cid::from_hex(&global)?;
+            let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
+            let node = NodeCanon {
+                kind: NodeKind::LoadGlobal,
+                ty,
+                inputs: Vec::new(),
+                effects,
+                payload: NodePayload::Global(global_cid),
+            };
+            node::store_node(&conn, &node)?
+        }
+    };
+    let cid_hex = cid::to_hex(&outcome.cid);
+    if outcome.inserted {
+        println!("stored node with cid {cid_hex}");
+    } else {
+        println!("node already present with cid {cid_hex}");
+    }
+    Ok(())
+}
+
+fn cmd_word(store: &Path, command: WordCommand) -> Result<()> {
+    match command {
+        WordCommand::Add {
+            name,
+            root,
+            params,
+            results,
+            no_register,
+        } => {
+            let conn = open_store(store)?;
+            let root_cid = cid::from_hex(&root)?;
+            let word = WordCanon {
+                root: root_cid,
+                params,
+                results,
+            };
+            let outcome = word::store_word(&conn, &word)?;
+            if !no_register {
+                if let Some(name) = &name {
+                    put_name(&conn, "word", name, &outcome.cid)?;
+                }
+            }
+            let cid_hex = cid::to_hex(&outcome.cid);
+            if outcome.inserted {
+                println!("stored word with cid {cid_hex}");
+            } else {
+                println!("word already present with cid {cid_hex}");
+            }
+        }
+        WordCommand::List { prefix } => {
+            let conn = open_store(store)?;
+            list_scope(&conn, "word", prefix.as_deref(), "no words registered")?;
         }
     }
     Ok(())
@@ -177,4 +549,156 @@ fn parse_attrs(entries: &[String]) -> Result<Vec<(String, String)>> {
         pairs.push((key.to_string(), value.to_string()));
     }
     Ok(pairs)
+}
+
+/// Convert CLI type atoms into `TypeTag`s.
+fn parse_type_tags(entries: &[String]) -> Result<Vec<TypeTag>> {
+    entries.iter().map(|s| TypeTag::from_atom(s)).collect()
+}
+
+/// Parse an iterator of hexadecimal CIDs into 32-byte arrays.
+fn parse_cid_list<'a, I>(entries: I) -> Result<Vec<[u8; 32]>>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let mut cids = Vec::new();
+    for entry in entries {
+        cids.push(cid::from_hex(entry)?);
+    }
+    Ok(cids)
+}
+
+/// Parse `CID:PORT` strings into node inputs.
+fn parse_inputs(entries: &[String]) -> Result<Vec<NodeInput>> {
+    let mut inputs = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some((cid_hex, port_str)) = entry.split_once(':') else {
+            bail!("invalid input `{entry}`; expected CID:PORT");
+        };
+        let cid = cid::from_hex(cid_hex)?;
+        let port: u32 = port_str
+            .parse()
+            .map_err(|_| anyhow!("invalid port `{port_str}` in `{entry}`; expected integer"))?;
+        inputs.push(NodeInput { cid, port });
+    }
+    Ok(inputs)
+}
+
+/// Dump the name_index rows for a given scope (optionally filtered by prefix).
+fn list_scope(conn: &Connection, scope: &str, prefix: Option<&str>, empty_msg: &str) -> Result<()> {
+    let sql_prefix =
+        "SELECT name, cid FROM name_index WHERE scope = ?1 AND name LIKE ?2 ORDER BY name";
+    let sql_all = "SELECT name, cid FROM name_index WHERE scope = ?1 ORDER BY name";
+
+    let mut stmt = if prefix.is_some() {
+        conn.prepare(sql_prefix)?
+    } else {
+        conn.prepare(sql_all)?
+    };
+
+    let mut rows = if let Some(prefix) = prefix {
+        let pattern = format!("{prefix}%");
+        stmt.query((scope, pattern))?
+    } else {
+        stmt.query([scope])?
+    };
+
+    let mut found = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
+        let cid_blob: Vec<u8> = row.get(1)?;
+        let cid = cid::from_slice(&cid_blob)?;
+        println!("{name} -> {}", cid::to_hex(&cid));
+        found = true;
+    }
+
+    if !found {
+        println!("{empty_msg}");
+    }
+
+    Ok(())
+}
+
+/// Parse a `--symbol` specification of the form `name(params) -> results | effects`.
+fn parse_iface_symbol(spec: &str) -> Result<IfaceSymbol> {
+    let mut parts = spec.splitn(2, '|');
+    let sig_part = parts
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("invalid symbol spec `{spec}`"))?;
+    let effects_part = parts.next().map(str::trim).unwrap_or("");
+
+    let (name, params, results) = parse_signature(sig_part)?;
+
+    let effects = if effects_part.is_empty() {
+        Vec::new()
+    } else {
+        let effect_tokens: Vec<&str> = effects_part
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        parse_cid_list(effect_tokens.iter().copied())?
+    };
+
+    Ok(IfaceSymbol {
+        name,
+        params,
+        results,
+        effects,
+    })
+}
+
+/// Split `name(params) -> results` into components.
+fn parse_signature(spec: &str) -> Result<(String, Vec<String>, Vec<String>)> {
+    let spec = spec.trim();
+    let open_paren = spec
+        .find('(')
+        .ok_or_else(|| anyhow!("missing '(' in `{spec}`"))?;
+    let name = spec[..open_paren].trim();
+    if name.is_empty() {
+        bail!("symbol name cannot be empty in `{spec}`");
+    }
+
+    let remainder = &spec[open_paren + 1..];
+    let close_paren = remainder
+        .find(')')
+        .ok_or_else(|| anyhow!("missing ')' in `{spec}`"))?;
+    let params_part = &remainder[..close_paren];
+    let after_paren = remainder[close_paren + 1..].trim();
+    let arrow = after_paren
+        .strip_prefix("->")
+        .ok_or_else(|| anyhow!("missing '->' in `{spec}`"))?;
+    let results_part = arrow.trim();
+
+    let params = parse_type_list(params_part)?;
+    let results = parse_type_list(results_part)?;
+
+    Ok((name.to_string(), params, results))
+}
+
+/// Turn a comma-separated list (optionally wrapped in parentheses) into type strings.
+fn parse_type_list(spec: &str) -> Result<Vec<String>> {
+    let mut s = spec.trim();
+    if s.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if s.starts_with('(') {
+        if !s.ends_with(')') {
+            bail!("unmatched parentheses in type list `{spec}`");
+        }
+        s = &s[1..s.len() - 1];
+    }
+
+    let mut types = Vec::new();
+    for part in s.split(',') {
+        let ty = part.trim();
+        if ty.is_empty() {
+            continue;
+        }
+        types.push(ty.to_string());
+    }
+    Ok(types)
 }

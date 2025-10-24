@@ -1,19 +1,28 @@
+//! Canonical encoding and storage helpers for effect descriptors.
+
 use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::cbor::{push_map, push_text};
 use crate::{cid, store};
 
+/// Shape of an effect descriptor before encoding.
 pub struct EffectCanon<'a> {
+    /// Human readable effect name (e.g. `"io"`).
     pub name: &'a str,
+    /// Optional documentation string; excluded from the CID if omitted.
     pub doc: Option<&'a str>,
 }
 
+/// Result of attempting to persist an effect.
 pub struct EffectStoreOutcome {
+    /// CID of the encoded effect.
     pub cid: [u8; 32],
+    /// True when a new row was inserted, false when it already existed.
     pub inserted: bool,
 }
 
+/// Encode an effect descriptor into canonical CBOR.
 pub fn encode(effect: &EffectCanon) -> Vec<u8> {
     let mut buf = Vec::new();
     let map_len = if effect.doc.is_some() { 3 } else { 2 };
@@ -33,6 +42,7 @@ pub fn encode(effect: &EffectCanon) -> Vec<u8> {
     buf
 }
 
+/// Persist an effect descriptor into the object store.
 pub fn store_effect(conn: &Connection, effect: &EffectCanon) -> Result<EffectStoreOutcome> {
     let cbor = encode(effect);
     let cid = cid::compute(&cbor);

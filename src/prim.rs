@@ -1,22 +1,42 @@
+//! Canonical encoding, storage, and metadata helpers for primitive descriptors.
+
 use std::cmp::Ordering;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use rusqlite::Connection;
+use serde::Deserialize;
 
-use crate::cbor::{push_array, push_map, push_text};
+use crate::cbor::{push_map, push_text};
+use crate::types::{TypeTag, encode_type_signature};
 use crate::{cid, store};
 
+/// Structured representation of a primitive prior to encoding.
 pub struct PrimCanon<'a> {
-    pub params: &'a [&'a str],
-    pub results: &'a [&'a str],
+    /// Parameter type tags in call order.
+    pub params: &'a [TypeTag],
+    /// Result type tags in return order.
+    pub results: &'a [TypeTag],
+    /// Optional key/value attribute pairs (sorted before encoding).
     pub attrs: &'a [(&'a str, &'a str)],
 }
 
+/// Result of persisting a primitive descriptor.
 pub struct PrimStoreOutcome {
+    /// CID of the canonical primitive object.
     pub cid: [u8; 32],
+    /// True when a new row was inserted, false if it already existed.
     pub inserted: bool,
 }
 
+/// Convenience metadata used by the graph builder.
+#[derive(Clone, Debug)]
+pub struct PrimInfo {
+    pub params: Vec<TypeTag>,
+    pub results: Vec<TypeTag>,
+    pub effects: Vec<[u8; 32]>,
+}
+
+/// Encode a primitive into canonical CBOR.
 pub fn encode(prim: &PrimCanon) -> Vec<u8> {
     let mut buf = Vec::new();
     let has_attrs = !prim.attrs.is_empty();
@@ -27,7 +47,9 @@ pub fn encode(prim: &PrimCanon) -> Vec<u8> {
     push_text(&mut buf, "prim");
 
     push_text(&mut buf, "type");
-    encode_type(&mut buf, prim.params, prim.results);
+    let params: Vec<&str> = prim.params.iter().map(|tag| tag.as_atom()).collect();
+    let results: Vec<&str> = prim.results.iter().map(|tag| tag.as_atom()).collect();
+    encode_type_signature(&mut buf, &params, &results);
 
     if has_attrs {
         push_text(&mut buf, "attrs");
@@ -37,6 +59,7 @@ pub fn encode(prim: &PrimCanon) -> Vec<u8> {
     buf
 }
 
+/// Persist a primitive into the object store.
 pub fn store_prim(conn: &Connection, prim: &PrimCanon) -> Result<PrimStoreOutcome> {
     let cbor = encode(prim);
     let cid = cid::compute(&cbor);
@@ -44,20 +67,36 @@ pub fn store_prim(conn: &Connection, prim: &PrimCanon) -> Result<PrimStoreOutcom
     Ok(PrimStoreOutcome { cid, inserted })
 }
 
-fn encode_type(buf: &mut Vec<u8>, params: &[&str], results: &[&str]) {
-    push_map(buf, 2);
-
-    push_text(buf, "params");
-    push_array(buf, params.len() as u64);
-    for p in params {
-        push_text(buf, p);
+/// Load primitive metadata required by the graph builder.
+pub fn load_prim_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<PrimInfo> {
+    let cbor: Vec<u8> = conn.query_row(
+        "SELECT cbor FROM object WHERE cid = ?1 AND kind = 'prim'",
+        [cid_bytes.as_slice()],
+        |row| row.get(0),
+    )?;
+    let record: PrimRecord =
+        serde_cbor::from_slice(&cbor).with_context(|| "failed to decode primitive CBOR payload")?;
+    if record.kind != "prim" {
+        bail!("object kind mismatch while loading prim: {}", record.kind);
     }
-
-    push_text(buf, "results");
-    push_array(buf, results.len() as u64);
-    for r in results {
-        push_text(buf, r);
-    }
+    let params = record
+        .ty
+        .params
+        .iter()
+        .map(|s| TypeTag::from_atom(s))
+        .collect::<Result<Vec<_>>>()?;
+    let results = record
+        .ty
+        .results
+        .iter()
+        .map(|s| TypeTag::from_atom(s))
+        .collect::<Result<Vec<_>>>()?;
+    // TODO: surface declared effects once encoded.
+    Ok(PrimInfo {
+        params,
+        results,
+        effects: Vec::new(),
+    })
 }
 
 fn encode_attrs(buf: &mut Vec<u8>, attrs: &[(&str, &str)]) {
@@ -74,14 +113,28 @@ fn encode_attrs(buf: &mut Vec<u8>, attrs: &[(&str, &str)]) {
     }
 }
 
+#[derive(Deserialize)]
+struct PrimRecord {
+    kind: String,
+    #[serde(rename = "type")]
+    ty: PrimTypeRecord,
+}
+
+#[derive(Deserialize)]
+struct PrimTypeRecord {
+    params: Vec<String>,
+    results: Vec<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[test]
     fn encode_without_attrs() {
-        let params = ["i64", "i64"];
-        let results = ["i64"];
+        let params = [TypeTag::I64, TypeTag::I64];
+        let results = [TypeTag::I64];
         let prim = PrimCanon {
             params: &params,
             results: &results,
@@ -104,8 +157,8 @@ mod tests {
 
     #[test]
     fn encode_with_attrs_sorted() {
-        let params = ["i64"];
-        let results = ["i64"];
+        let params = [TypeTag::I64];
+        let results = [TypeTag::I64];
         let attrs = [("commutative", "true"), ("category", "arith")];
         let prim = PrimCanon {
             params: &params,
@@ -126,5 +179,24 @@ mod tests {
             category_pos < commutative_pos,
             "attrs not sorted: {encoded:?}"
         );
+    }
+
+    #[test]
+    fn roundtrip_prim_info() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        crate::store::install_schema(&conn)?;
+
+        let params = [TypeTag::I64, TypeTag::I64];
+        let results = [TypeTag::I64];
+        let prim = PrimCanon {
+            params: &params,
+            results: &results,
+            attrs: &[],
+        };
+        let outcome = store_prim(&conn, &prim)?;
+        let info = load_prim_info(&conn, &outcome.cid)?;
+        assert_eq!(info.params, params);
+        assert_eq!(info.results, results);
+        Ok(())
     }
 }
