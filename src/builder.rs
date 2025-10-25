@@ -6,7 +6,7 @@
 //! wiring-only stack operations (`dup`, `swap`, `over`). Declared effects from
 //! primitives and words are accumulated so resulting nodes inherit effect sets.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
@@ -34,6 +34,7 @@ pub struct GraphBuilder<'conn> {
     prim_cache: HashMap<[u8; 32], PrimInfo>,
     word_cache: HashMap<[u8; 32], WordInfo>,
     accumulated_effects: Vec<[u8; 32]>,
+    effect_frontier: BTreeMap<[u8; 32], StackItem>,
 }
 
 impl<'conn> GraphBuilder<'conn> {
@@ -46,6 +47,7 @@ impl<'conn> GraphBuilder<'conn> {
             prim_cache: HashMap::new(),
             word_cache: HashMap::new(),
             accumulated_effects: Vec::new(),
+            effect_frontier: BTreeMap::new(),
         }
     }
 
@@ -54,6 +56,7 @@ impl<'conn> GraphBuilder<'conn> {
         self.stack.clear();
         self.param_types = params.to_vec();
         self.accumulated_effects.clear();
+        self.effect_frontier.clear();
 
         for (idx, ty) in params.iter().enumerate() {
             let node = NodeCanon {
@@ -214,20 +217,23 @@ impl<'conn> GraphBuilder<'conn> {
             })
             .collect();
 
-        let out_ty = *results
-            .get(0)
-            .ok_or_else(|| anyhow!("callee must have \u{2265}1 result"))?;
-
         let kind = match &payload {
             NodePayload::Prim(..) => NodeKind::Prim,
             NodePayload::Word(..) => NodeKind::Call,
             _ => unreachable!("apply_general: Prim/Word only"),
         };
 
+        let out_atoms: Vec<String> = results.iter().map(|t| t.as_atom().to_string()).collect();
+        let ty_field = if out_atoms.len() == 1 {
+            Some(out_atoms[0].clone())
+        } else {
+            None
+        };
+
         let node = NodeCanon {
             kind,
-            ty: Some(out_ty.as_atom().to_string()),
-            out: vec![out_ty.as_atom().to_string()],
+            ty: ty_field,
+            out: out_atoms,
             inputs: inputs.into_vec(),
             vals: Vec::new(),
             deps: Vec::new(),
@@ -237,11 +243,23 @@ impl<'conn> GraphBuilder<'conn> {
 
         let outcome = node::store_node(self.conn, &node)?;
         self.accumulated_effects.extend(effects.iter().copied());
-        self.stack.push(StackItem {
-            cid: outcome.cid,
-            port: 0,
-            ty: out_ty,
-        });
+        for (port, ty) in results.iter().copied().enumerate() {
+            self.stack.push(StackItem {
+                cid: outcome.cid,
+                port: port as u32,
+                ty,
+            });
+        }
+        for effect in effects {
+            self.effect_frontier.insert(
+                *effect,
+                StackItem {
+                    cid: outcome.cid,
+                    port: 0,
+                    ty: TypeTag::Unit,
+                },
+            );
+        }
         Ok(outcome.cid)
     }
 
@@ -292,49 +310,68 @@ impl<'conn> GraphBuilder<'conn> {
             );
         }
 
-        match results.len() {
-            0 => {
-                if !self.stack.is_empty() {
-                    bail!(
-                        "word declared Unit result but stack has {} value(s)",
-                        self.stack.len()
-                    );
-                }
-                bail!("unit-returning words not yet supported");
-            }
-            1 => {
-                if self.stack.len() != 1 {
-                    bail!(
-                        "word must leave exactly one result; stack has {}",
-                        self.stack.len()
-                    );
-                }
-                let top = self.stack.last().unwrap();
-                if top.ty != results[0] {
-                    bail!(
-                        "result type mismatch: expected {:?}, got {:?}",
-                        results[0],
-                        top.ty
-                    );
-                }
-            }
-            n => {
-                bail!("multi-result words (arity {n}) not supported yet");
-            }
+        if self.stack.len() != results.len() {
+            bail!(
+                "word must leave exactly {} result(s); stack has {}",
+                results.len(),
+                self.stack.len()
+            );
         }
 
-        let root = self
-            .stack
-            .last()
-            .ok_or_else(|| anyhow!("cannot finish word without a root node"))?;
+        let mut vals = Vec::with_capacity(results.len());
+        for (idx, expected) in results.iter().enumerate() {
+            let item = self
+                .stack
+                .get(self.stack.len() - 1 - idx)
+                .ok_or_else(|| anyhow!("stack underflow while collecting results"))?;
+            if item.ty != *expected {
+                bail!(
+                    "result {} type mismatch: expected {:?}, got {:?}",
+                    idx,
+                    expected,
+                    item.ty
+                );
+            }
+            vals.push(NodeInput {
+                cid: item.cid,
+                port: item.port,
+            });
+        }
+        let mut deps: Vec<NodeInput> = self
+            .effect_frontier
+            .values()
+            .map(|item| NodeInput {
+                cid: item.cid,
+                port: item.port,
+            })
+            .collect();
+        deps.sort_by(|a, b| match a.cid.cmp(&b.cid) {
+            std::cmp::Ordering::Equal => a.port.cmp(&b.port),
+            other => other,
+        });
+        deps.dedup_by(|a, b| a.cid == b.cid && a.port == b.port);
 
         self.accumulated_effects.sort_unstable();
         self.accumulated_effects.dedup();
 
+        let out_types: Vec<String> = results.iter().map(|t| t.as_atom().to_string()).collect();
+
+        let return_node = NodeCanon {
+            kind: NodeKind::Return,
+            ty: None,
+            out: out_types.clone(),
+            inputs: Vec::new(),
+            vals,
+            deps,
+            effects: Vec::new(),
+            payload: NodePayload::Return,
+        };
+        let return_outcome = node::store_node(self.conn, &return_node)?;
+
         let word = WordCanon {
-            root: root.cid,
+            root: return_outcome.cid,
             params: params.iter().map(|t| t.as_atom().to_string()).collect(),
-            results: results.iter().map(|t| t.as_atom().to_string()).collect(),
+            results: out_types,
             effects: self.accumulated_effects.clone(),
         };
         let outcome = word::store_word(self.conn, &word)?;
@@ -342,9 +379,10 @@ impl<'conn> GraphBuilder<'conn> {
             store::put_name(self.conn, "word", name, &outcome.cid)?;
         }
 
-        // Leave the final result on the stack for inspection, but reset param tracking.
+        // Leave the final results on the stack for inspection, but reset tracking.
         self.param_types.clear();
         self.accumulated_effects.clear();
+        self.effect_frontier.clear();
         Ok(outcome.cid)
     }
 
@@ -502,6 +540,41 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![cid1, cid4, cid1]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn finish_void_word_creates_return() -> Result<()> {
+        use serde_cbor::Value;
+
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[])?;
+
+        let word_cid = builder.finish_word(&[], &[], Some("demo/void"))?;
+
+        let info = crate::word::load_word_info(&conn, &word_cid)?;
+        assert!(info.results.is_empty());
+
+        let (_kind, cbor) = crate::load_object_cbor(&conn, &info.root)?;
+        let value: Value = serde_cbor::from_slice(&cbor)?;
+        let mut map = std::collections::BTreeMap::new();
+        if let Value::Map(entries) = value {
+            for (k, v) in entries {
+                if let Value::Text(key) = k {
+                    map.insert(key, v);
+                }
+            }
+        } else {
+            bail!("RETURN node did not encode as map");
+        }
+
+        assert_eq!(map.get("nk"), Some(&Value::Text("RETURN".to_string())));
+        assert_eq!(map.get("out"), Some(&Value::Array(Vec::new())));
+        assert_eq!(map.get("vals"), Some(&Value::Array(Vec::new())));
+
         Ok(())
     }
 }

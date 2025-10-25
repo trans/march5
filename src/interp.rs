@@ -52,16 +52,25 @@ pub fn run_word(conn: &Connection, word_cid: &[u8; 32], args: &[Value]) -> Resul
     }
 
     let mut cache = HashMap::new();
-    let value = eval_node(conn, &info.root, &mut cache, args)?;
-    let expected_ty = info.results[0];
-    if value.type_tag() != expected_ty {
+    let outputs = eval_return(conn, &info.root, &mut cache, args, &info.results)?;
+    if outputs.len() != info.results.len() {
         bail!(
-            "result type mismatch: expected {:?}, got {:?}",
-            expected_ty,
-            value.type_tag()
+            "result count mismatch: word declares {}, runner produced {}",
+            info.results.len(),
+            outputs.len()
         );
     }
-    Ok(vec![value])
+    for (idx, (expected, actual)) in info.results.iter().zip(outputs.iter()).enumerate() {
+        if actual.type_tag() != *expected {
+            bail!(
+                "result {} type mismatch: expected {:?}, got {:?}",
+                idx,
+                expected,
+                actual.type_tag()
+            );
+        }
+    }
+    Ok(outputs)
 }
 
 #[derive(Deserialize)]
@@ -106,6 +115,8 @@ struct NodePayloadRecord {
     arg: Option<u32>,
     #[serde(default)]
     word: Option<ByteBuf>,
+    #[serde(default)]
+    glob: Option<ByteBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,12 +204,54 @@ fn eval_node(
             }
             results.pop().unwrap()
         }
+        "RETURN" => bail!("RETURN node should be handled at word entry"),
         "LOAD_GLOBAL" => bail!("LOAD_GLOBAL not supported by runner (yet)"),
         kind => bail!("unsupported node kind `{kind}` in runner"),
     };
 
     cache.insert(*node_cid, value.clone());
     Ok(value)
+}
+
+fn eval_return(
+    conn: &Connection,
+    root: &[u8; 32],
+    cache: &mut HashMap<[u8; 32], Value>,
+    args: &[Value],
+    expected_results: &[TypeTag],
+) -> Result<Vec<Value>> {
+    let (_, cbor) = load_object_cbor(conn, root)?;
+    let record: NodeRecord = serde_cbor::from_slice(&cbor)?;
+    if record.kind != "node" {
+        bail!("root object {} is not a node", cid::to_hex(root));
+    }
+
+    if record.nk != "RETURN" {
+        // Legacy single-result root without RETURN.
+        let value = eval_node(conn, root, cache, args)?;
+        return Ok(vec![value]);
+    }
+
+    if record.vals.len() != expected_results.len() {
+        bail!(
+            "RETURN node value count {} does not match declared results {}",
+            record.vals.len(),
+            expected_results.len()
+        );
+    }
+
+    for dep in &record.deps {
+        let dep_cid = bytebuf_to_array(&dep.cid)?;
+        let _ = eval_node(conn, &dep_cid, cache, args)?;
+    }
+
+    let mut outputs = Vec::with_capacity(record.vals.len());
+    for input in &record.vals {
+        let input_cid = bytebuf_to_array(&input.cid)?;
+        let value = eval_node(conn, &input_cid, cache, args)?;
+        outputs.push(value);
+    }
+    Ok(outputs)
 }
 
 fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) -> Result<Value> {
