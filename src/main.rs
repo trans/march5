@@ -65,8 +65,13 @@ enum Command {
     },
     /// Interactive graph builder REPL
     Builder,
-    /// Execute a word and print its result (currently supports i64 literals only)
-    Run { name: String },
+    /// Execute a word and print its result
+    Run {
+        name: String,
+        /// Supply repeated --arg <i64> values for parameters
+        #[arg(long = "arg")]
+        args: Vec<i64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -278,9 +283,9 @@ fn run() -> Result<()> {
             let store_path = require_store_path(cli.store.as_deref())?;
             cmd_builder(store_path)
         }
-        Command::Run { name } => {
+        Command::Run { name, args } => {
             let store_path = require_store_path(cli.store.as_deref())?;
-            cmd_run(store_path, &name)
+            cmd_run(store_path, &name, &args)
         }
     }
 }
@@ -722,11 +727,11 @@ fn ensure_builder_begun(
     Ok(())
 }
 
-fn cmd_run(store: &Path, name: &str) -> Result<()> {
+fn cmd_run(store: &Path, name: &str, args: &[i64]) -> Result<()> {
     let conn = open_store(store)?;
     let word_cid =
         get_name(&conn, "word", name)?.ok_or_else(|| anyhow!("word `{name}` not found"))?;
-    let result = run_word_i64(&conn, &word_cid)?;
+    let result = run_word_i64(&conn, &word_cid, args)?;
     println!("{result}");
     Ok(())
 }

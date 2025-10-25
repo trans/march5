@@ -9,14 +9,25 @@ use crate::prim::load_prim_info;
 use crate::word::load_word_info;
 use crate::{TypeTag, cid, list_names_for_cid, load_object_cbor};
 
-/// Evaluates a word that returns a single `i64` result.
-pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32]) -> Result<i64> {
+/// Evaluates a word and returns its single `i64` result.
+/// Currently supports words whose parameters and results are all `i64`.
+pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32], args: &[i64]) -> Result<i64> {
     let info = load_word_info(conn, word_cid)?;
-    if info.params.len() != 0 {
+    if info.params.len() != args.len() {
         bail!(
-            "runner currently supports zero-argument words ({} params)",
-            info.params.len()
+            "argument mismatch: word expects {} params, got {}",
+            info.params.len(),
+            args.len()
         );
+    }
+    for (idx, ty) in info.params.iter().enumerate() {
+        if *ty != TypeTag::I64 {
+            bail!(
+                "runner only supports i64 parameters (param {} has type {:?})",
+                idx,
+                ty
+            );
+        }
     }
     if info.results.len() != 1 || info.results[0] != TypeTag::I64 {
         bail!(
@@ -25,8 +36,9 @@ pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32]) -> Result<i64> {
         );
     }
 
+    let arg_values: Vec<Value> = args.iter().copied().map(Value::I64).collect();
     let mut cache = HashMap::new();
-    let value = eval_node(conn, &info.root, &mut cache)?;
+    let value = eval_node(conn, &info.root, &mut cache, &arg_values)?;
     match value {
         Value::I64(n) => Ok(n),
     }
@@ -78,6 +90,7 @@ fn eval_node(
     conn: &Connection,
     node_cid: &[u8; 32],
     cache: &mut HashMap<[u8; 32], Value>,
+    args: &[Value],
 ) -> Result<Value> {
     if let Some(value) = cache.get(node_cid) {
         return Ok(value.clone());
@@ -89,12 +102,6 @@ fn eval_node(
         bail!("object {} is not a node", cid::to_hex(node_cid));
     }
 
-    let mut inputs = Vec::new();
-    for input in &record.inputs {
-        let input_cid = bytebuf_to_array(&input.cid)?;
-        inputs.push(eval_node(conn, &input_cid, cache)?);
-    }
-
     let value = match record.nk.as_str() {
         "LIT" => {
             let lit = record
@@ -103,8 +110,22 @@ fn eval_node(
                 .ok_or_else(|| anyhow!("LIT node missing literal payload"))?;
             Value::I64(lit)
         }
-        "ARG" => bail!("ARG nodes not supported in runner"),
+        "ARG" => {
+            let index = record
+                .payload
+                .arg
+                .ok_or_else(|| anyhow!("ARG node missing index payload"))? as usize;
+            args
+                .get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("argument {index} not supplied"))?
+        }
         "PRIM" => {
+            let mut inputs = Vec::new();
+            for input in &record.inputs {
+                let input_cid = bytebuf_to_array(&input.cid)?;
+                inputs.push(eval_node(conn, &input_cid, cache, args)?);
+            }
             let prim_cid_buf = record
                 .payload
                 .prim
@@ -113,12 +134,23 @@ fn eval_node(
             eval_primitive(conn, &prim_cid, inputs)?
         }
         "CALL" => {
+            let mut inputs = Vec::new();
+            for input in &record.inputs {
+                let input_cid = bytebuf_to_array(&input.cid)?;
+                inputs.push(eval_node(conn, &input_cid, cache, args)?);
+            }
             let word_buf = record
                 .payload
                 .word
                 .ok_or_else(|| anyhow!("CALL node missing word payload"))?;
             let word_cid = bytebuf_to_array(&word_buf)?;
-            Value::I64(run_word_i64(conn, &word_cid)?)
+            let call_args = inputs
+                .into_iter()
+                .map(|v| match v {
+                    Value::I64(n) => Ok(n),
+                })
+                .collect::<Result<Vec<i64>>>()?;
+            Value::I64(run_word_i64(conn, &word_cid, &call_args)?)
         }
         kind => bail!("unsupported node kind `{kind}` in runner"),
     };
