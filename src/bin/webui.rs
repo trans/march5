@@ -5,7 +5,10 @@ use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use march5::prim::load_prim_info;
 use march5::word::load_word_info;
-use march5::{TypeTag, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store};
+use march5::{
+    TypeTag, cid, create_store, derive_db_path, get_name, list_names_for_cid, load_object_cbor,
+    open_store,
+};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
@@ -332,7 +335,7 @@ fn collect_namespace_rows(conn: &Connection) -> Result<Vec<NamespaceRow>> {
             .map(|e| {
                 let word_arr = bytebuf_to_array(&e.word)?;
                 let word_cid_hex = cid::to_hex(&word_arr);
-                let word_name = lookup_names_for_cid(conn, "word", &word_arr)?
+                let word_name = list_names_for_cid(conn, "word", &word_arr)?
                     .into_iter()
                     .next();
                 Ok(NsExport {
@@ -548,17 +551,6 @@ fn bytebuf_to_array(buf: &ByteBuf) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(slice);
     Ok(out)
-}
-
-fn lookup_names_for_cid(conn: &Connection, scope: &str, cid: &[u8; 32]) -> Result<Vec<String>> {
-    let mut stmt =
-        conn.prepare("SELECT name FROM name_index WHERE scope = ?1 AND cid = ?2 ORDER BY name")?;
-    let mut rows = stmt.query(params![scope, &cid[..]])?;
-    let mut names = Vec::new();
-    while let Some(row) = rows.next()? {
-        names.push(row.get(0)?);
-    }
-    Ok(names)
 }
 
 #[derive(Deserialize)]

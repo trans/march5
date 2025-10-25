@@ -117,6 +117,18 @@ pub fn put_name(conn: &Connection, scope: &str, name: &str, cid: &[u8; 32]) -> R
     Ok(())
 }
 
+/// Return all names registered for a given CID within `scope` (sorted ascending).
+pub fn list_names_for_cid(conn: &Connection, scope: &str, cid: &[u8; 32]) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM name_index WHERE scope = ?1 AND cid = ?2 ORDER BY name")?;
+    let mut rows = stmt.query(params![scope, &cid[..]])?;
+    let mut names = Vec::new();
+    while let Some(row) = rows.next()? {
+        names.push(row.get(0)?);
+    }
+    Ok(names)
+}
+
 /// Lookup a CID by scope/name in `name_index`.
 pub fn get_name(conn: &Connection, scope: &str, name: &str) -> Result<Option<[u8; 32]>> {
     let mut stmt = conn.prepare("SELECT cid FROM name_index WHERE scope = ?1 AND name = ?2")?;

@@ -23,8 +23,8 @@ pub use namespace::{NamespaceCanon, NamespaceExport, NamespaceStoreOutcome};
 pub use node::{NodeCanon, NodeInput, NodeKind, NodePayload, NodeStoreOutcome};
 pub use prim::{PrimCanon, PrimInfo, PrimStoreOutcome};
 pub use store::{
-    create_store, derive_db_path, ensure_parent_dirs, get_name, load_object_cbor, open_store,
-    put_name,
+    create_store, derive_db_path, ensure_parent_dirs, get_name, list_names_for_cid,
+    load_object_cbor, open_store, put_name,
 };
 pub use types::TypeTag;
 pub use word::{WordCanon, WordStoreOutcome};
