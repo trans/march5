@@ -20,6 +20,9 @@ pub use iface::{IfaceCanon, IfaceStoreOutcome, IfaceSymbol};
 pub use namespace::{NamespaceCanon, NamespaceExport, NamespaceStoreOutcome};
 pub use node::{NodeCanon, NodeInput, NodeKind, NodePayload, NodeStoreOutcome};
 pub use prim::{PrimCanon, PrimInfo, PrimStoreOutcome};
-pub use store::{create_store, derive_db_path, ensure_parent_dirs, open_store, put_name};
+pub use store::{
+    create_store, derive_db_path, ensure_parent_dirs, get_name, load_object_cbor, open_store,
+    put_name,
+};
 pub use types::TypeTag;
 pub use word::{WordCanon, WordStoreOutcome};

@@ -10,7 +10,9 @@ use march5::namespace::{self, NamespaceCanon, NamespaceExport};
 use march5::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use march5::prim::{self, PrimCanon};
 use march5::word::{self, WordCanon};
-use march5::{TypeTag, cid, create_store, derive_db_path, open_store, put_name};
+use march5::{
+    TypeTag, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store, put_name,
+};
 
 #[derive(Parser)]
 #[command(name = "march5", version, about = "March α₅ CLI tooling")]
@@ -119,6 +121,8 @@ enum IfaceCommand {
         #[arg(long = "prefix")]
         prefix: Option<String>,
     },
+    /// Show canonical JSON for an interface
+    Show { name: String },
 }
 
 #[derive(Subcommand)]
@@ -146,6 +150,8 @@ enum NamespaceCommand {
         #[arg(long = "prefix")]
         prefix: Option<String>,
     },
+    /// Show canonical JSON for a namespace by name
+    Show { name: String },
 }
 
 #[derive(Subcommand)]
@@ -220,6 +226,8 @@ enum WordCommand {
         #[arg(long = "no-register")]
         no_register: bool,
     },
+    /// Show a word's canonical JSON by name
+    Show { name: String },
     /// List registered words (optionally filtered by prefix)
     List {
         #[arg(long = "prefix")]
@@ -373,6 +381,10 @@ fn cmd_iface(store: &Path, command: IfaceCommand) -> Result<()> {
                 "no interfaces registered",
             )?;
         }
+        IfaceCommand::Show { name } => {
+            let conn = open_store(store)?;
+            show_named_object(&conn, "iface", "interface", &name)?;
+        }
     }
     Ok(())
 }
@@ -428,6 +440,10 @@ fn cmd_namespace(store: &Path, command: NamespaceCommand) -> Result<()> {
                 prefix.as_deref(),
                 "no namespaces registered",
             )?;
+        }
+        NamespaceCommand::Show { name } => {
+            let conn = open_store(store)?;
+            show_named_object(&conn, "namespace", "namespace", &name)?;
         }
     }
     Ok(())
@@ -554,6 +570,10 @@ fn cmd_word(store: &Path, command: WordCommand) -> Result<()> {
         WordCommand::List { prefix } => {
             let conn = open_store(store)?;
             list_scope(&conn, "word", prefix.as_deref(), "no words registered")?;
+        }
+        WordCommand::Show { name } => {
+            let conn = open_store(store)?;
+            show_named_object(&conn, "word", "word", &name)?;
         }
     }
     Ok(())
@@ -885,9 +905,24 @@ fn parse_type_list(spec: &str) -> Result<Vec<String>> {
     Ok(types)
 }
 
+fn cbor_to_pretty_json(bytes: &[u8]) -> Result<String> {
+    let value: serde_cbor::Value = serde_cbor::from_slice(bytes)?;
+    let json = serde_json::to_string_pretty(&value)?;
+    Ok(json)
+}
+
+fn show_named_object(conn: &Connection, scope: &str, label: &str, name: &str) -> Result<()> {
+    let cid = get_name(conn, scope, name)?.ok_or_else(|| anyhow!("{label} `{name}` not found"))?;
+    let (_kind, cbor) = load_object_cbor(conn, &cid)?;
+    let json = cbor_to_pretty_json(&cbor)?;
+    println!("{json}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn parse_exports_pairs() {
@@ -903,5 +938,14 @@ mod cli_tests {
         let cid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let err = parse_exports(&vec![format!(" ={cid}")]).unwrap_err();
         assert!(err.to_string().contains("export name cannot be empty"));
+    }
+
+    #[test]
+    fn cbor_json_round_trip() {
+        let value = json!({"kind": "test", "value": 42});
+        let bytes = serde_cbor::to_vec(&value).unwrap();
+        let json = cbor_to_pretty_json(&bytes).unwrap();
+        assert!(json.contains("\"kind\": \"test\""));
+        assert!(json.contains("42"));
     }
 }

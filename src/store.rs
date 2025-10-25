@@ -116,3 +116,29 @@ pub fn put_name(conn: &Connection, scope: &str, name: &str, cid: &[u8; 32]) -> R
     )?;
     Ok(())
 }
+
+/// Lookup a CID by scope/name in `name_index`.
+pub fn get_name(conn: &Connection, scope: &str, name: &str) -> Result<Option<[u8; 32]>> {
+    let mut stmt = conn.prepare("SELECT cid FROM name_index WHERE scope = ?1 AND name = ?2")?;
+    let mut rows = stmt.query(params![scope, name])?;
+    if let Some(row) = rows.next()? {
+        let blob: Vec<u8> = row.get(0)?;
+        let cid = crate::cid::from_slice(&blob)?;
+        Ok(Some(cid))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Load the raw CBOR payload (and kind) for a given CID.
+pub fn load_object_cbor(conn: &Connection, cid: &[u8; 32]) -> Result<(String, Vec<u8>)> {
+    let mut stmt = conn.prepare("SELECT kind, cbor FROM object WHERE cid = ?1")?;
+    let mut rows = stmt.query(params![&cid[..]])?;
+    if let Some(row) = rows.next()? {
+        let kind: String = row.get(0)?;
+        let cbor: Vec<u8> = row.get(1)?;
+        Ok((kind, cbor))
+    } else {
+        bail!("object `{}` not found", crate::cid::to_hex(cid));
+    }
+}
