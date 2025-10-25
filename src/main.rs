@@ -114,12 +114,12 @@ enum PrimCommand {
 enum IfaceCommand {
     /// Insert or update an interface descriptor
     Add {
-        /// Optional human/name-index entry
-        #[arg(long = "name")]
-        name: Option<String>,
-        /// Symbol specifications of the form `symbol(param,...) -> result,... | effectCID,...`
-        #[arg(long = "symbol", required = true, value_name = "SPEC")]
-        symbols: Vec<String>,
+        /// Optional name_index registration
+        #[arg(long = "register", value_name = "NAME")]
+        register: Option<String>,
+        /// Export specifications of the form `name(param,...) -> result,... | effectCID,...`
+        #[arg(long = "name", required = true, value_name = "SPEC")]
+        names: Vec<String>,
         /// Skip name_index registration
         #[arg(long = "no-register")]
         no_register: bool,
@@ -361,19 +361,19 @@ fn cmd_prim(store: &Path, command: PrimCommand) -> Result<()> {
 fn cmd_iface(store: &Path, command: IfaceCommand) -> Result<()> {
     match command {
         IfaceCommand::Add {
-            name,
-            symbols,
+            register,
+            names,
             no_register,
         } => {
             let conn = open_store(store)?;
-            let mut parsed = Vec::with_capacity(symbols.len());
-            for spec in symbols {
-                parsed.push(parse_iface_symbol(&spec)?);
+            let mut parsed = Vec::with_capacity(names.len());
+            for spec in names {
+                parsed.push(parse_iface_spec(&spec)?);
             }
-            let iface = IfaceCanon { symbols: parsed };
+            let iface = IfaceCanon { names: parsed };
             let outcome = iface::store_iface(&conn, &iface)?;
             if !no_register {
-                if let Some(name) = &name {
+                if let Some(name) = &register {
                     put_name(&conn, "iface", name, &outcome.cid)?;
                 }
             }
@@ -468,8 +468,11 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::Lit,
-                ty,
+                ty: Some(ty.clone()),
+                out: vec![ty],
                 inputs: Vec::new(),
+                vals: Vec::new(),
+                deps: Vec::new(),
                 effects,
                 payload: NodePayload::LitI64(value),
             };
@@ -486,8 +489,11 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::Prim,
-                ty,
+                ty: Some(ty.clone()),
+                out: vec![ty],
                 inputs,
+                vals: Vec::new(),
+                deps: Vec::new(),
                 effects,
                 payload: NodePayload::Prim(prim_cid),
             };
@@ -504,8 +510,11 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::Call,
-                ty,
+                ty: Some(ty.clone()),
+                out: vec![ty],
                 inputs,
+                vals: Vec::new(),
+                deps: Vec::new(),
                 effects,
                 payload: NodePayload::Word(word_cid),
             };
@@ -515,8 +524,11 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::Arg,
-                ty,
+                ty: Some(ty.clone()),
+                out: vec![ty],
                 inputs: Vec::new(),
+                vals: Vec::new(),
+                deps: Vec::new(),
                 effects,
                 payload: NodePayload::Arg(index),
             };
@@ -531,8 +543,11 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::LoadGlobal,
-                ty,
+                ty: Some(ty.clone()),
+                out: vec![ty],
                 inputs: Vec::new(),
+                vals: Vec::new(),
+                deps: Vec::new(),
                 effects,
                 payload: NodePayload::Global(global_cid),
             };
@@ -842,14 +857,14 @@ fn list_scope(conn: &Connection, scope: &str, prefix: Option<&str>, empty_msg: &
     Ok(())
 }
 
-/// Parse a `--symbol` specification of the form `name(params) -> results | effects`.
-fn parse_iface_symbol(spec: &str) -> Result<IfaceSymbol> {
+/// Parse a `--name` specification of the form `name(params) -> results | effects`.
+fn parse_iface_spec(spec: &str) -> Result<IfaceSymbol> {
     let mut parts = spec.splitn(2, '|');
     let sig_part = parts
         .next()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("invalid symbol spec `{spec}`"))?;
+        .ok_or_else(|| anyhow!("invalid name spec `{spec}`"))?;
     let effects_part = parts.next().map(str::trim).unwrap_or("");
 
     let (name, params, results) = parse_signature(sig_part)?;
@@ -881,7 +896,7 @@ fn parse_signature(spec: &str) -> Result<(String, Vec<String>, Vec<String>)> {
         .ok_or_else(|| anyhow!("missing '(' in `{spec}`"))?;
     let name = spec[..open_paren].trim();
     if name.is_empty() {
-        bail!("symbol name cannot be empty in `{spec}`");
+        bail!("export name cannot be empty in `{spec}`");
     }
 
     let remainder = &spec[open_paren + 1..];
@@ -943,7 +958,9 @@ fn show_named_object(conn: &Connection, scope: &str, label: &str, name: &str) ->
 #[cfg(test)]
 mod cli_tests {
     use super::*;
+    use serde_cbor::Value;
     use serde_json::json;
+    use tempfile::tempdir;
 
     #[test]
     fn parse_exports_pairs() {
@@ -968,5 +985,121 @@ mod cli_tests {
         let json = cbor_to_pretty_json(&bytes).unwrap();
         assert!(json.contains("\"kind\": \"test\""));
         assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn cmd_effect_add_persists_object() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("cli-effects.march5.db");
+        let _ = create_store(&db_path)?;
+
+        cmd_effect(
+            &db_path,
+            EffectCommand::Add {
+                name: "io".to_string(),
+                doc: Some("performs input/output".to_string()),
+            },
+        )?;
+
+        let conn = open_store(&db_path)?;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM object WHERE kind = 'effect'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_prim_add_registers_name() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("cli-prims.march5.db");
+        let _ = create_store(&db_path)?;
+
+        cmd_prim(
+            &db_path,
+            PrimCommand::Add {
+                name: "demo/add".to_string(),
+                params: vec!["i64".to_string(), "i64".to_string()],
+                results: vec!["i64".to_string()],
+                attrs: vec![],
+                effects: vec![],
+                no_register: false,
+            },
+        )?;
+
+        let conn = open_store(&db_path)?;
+        let cid = get_name(&conn, "prim", "demo/add")?.expect("name registered");
+        let (kind, cbor) = load_object_cbor(&conn, &cid)?;
+        assert_eq!(kind, "prim");
+
+        let mut prim_kind = None;
+        if let Value::Map(entries) = serde_cbor::from_slice::<Value>(&cbor)? {
+            for (key, value) in entries {
+                if let Value::Text(k) = key {
+                    if k == "kind" {
+                        if let Value::Text(v) = value {
+                            prim_kind = Some(v);
+                        }
+                    }
+                }
+            }
+        } else {
+            panic!("primitive CBOR must be a map");
+        }
+        assert_eq!(prim_kind.as_deref(), Some("prim"));
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_iface_add_registers_name() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("cli-iface.march5.db");
+        let _ = create_store(&db_path)?;
+
+        cmd_iface(
+            &db_path,
+            IfaceCommand::Add {
+                register: Some("demo.iface/math".to_string()),
+                names: vec!["hello() -> unit".to_string()],
+                no_register: false,
+            },
+        )?;
+
+        let conn = open_store(&db_path)?;
+        let cid = get_name(&conn, "iface", "demo.iface/math")?.expect("name registered");
+        let (_, cbor) = load_object_cbor(&conn, &cid)?;
+
+        let value: Value = serde_cbor::from_slice(&cbor)?;
+        let mut found_exports = Vec::new();
+        if let Value::Map(entries) = value {
+            for (key, val) in entries {
+                if let Value::Text(k) = key {
+                    if k == "names" {
+                        if let Value::Array(symbols) = val {
+                            for symbol in symbols {
+                                if let Value::Map(sym_entries) = symbol {
+                                    for (sym_key, sym_val) in sym_entries {
+                                        if let Value::Text(sym_key_name) = sym_key {
+                                            if sym_key_name == "name" {
+                                                if let Value::Text(sym_name) = sym_val {
+                                                    found_exports.push(sym_name);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            panic!("interface CBOR must be a map");
+        }
+
+        assert_eq!(found_exports, vec!["hello".to_string()]);
+        Ok(())
     }
 }

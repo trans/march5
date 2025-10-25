@@ -13,6 +13,19 @@ use crate::{TypeTag, cid, list_names_for_cid, load_object_cbor};
 /// Evaluates a word and returns its single `i64` result.
 /// Currently supports words whose parameters and results are all `i64`.
 pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32], args: &[i64]) -> Result<i64> {
+    let arg_values: Vec<Value> = args.iter().copied().map(Value::I64).collect();
+    let mut results = run_word(conn, word_cid, &arg_values)?;
+    let value = results
+        .pop()
+        .ok_or_else(|| anyhow!("runner expected a single result"))?;
+    match value {
+        Value::I64(n) => Ok(n),
+        other => bail!("expected i64 result, got {:?}", other.type_tag()),
+    }
+}
+
+/// Evaluate a word and return its result values.
+pub fn run_word(conn: &Connection, word_cid: &[u8; 32], args: &[Value]) -> Result<Vec<Value>> {
     let info = load_word_info(conn, word_cid)?;
     if info.params.len() != args.len() {
         bail!(
@@ -21,28 +34,34 @@ pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32], args: &[i64]) -> Res
             args.len()
         );
     }
-    for (idx, ty) in info.params.iter().enumerate() {
-        if *ty != TypeTag::I64 {
+    for (idx, (expected, actual)) in info.params.iter().zip(args.iter()).enumerate() {
+        let actual_tag = actual.type_tag();
+        if *expected != actual_tag {
             bail!(
-                "runner only supports i64 parameters (param {} has type {:?})",
-                idx,
-                ty
+                "argument {idx} type mismatch: expected {:?}, got {:?}",
+                expected,
+                actual_tag
             );
         }
     }
-    if info.results.len() != 1 || info.results[0] != TypeTag::I64 {
+    if info.results.len() != 1 {
         bail!(
-            "runner expects a single i64 result, found {:?}",
+            "runner currently requires exactly one result, found {:?}",
             info.results
         );
     }
 
-    let arg_values: Vec<Value> = args.iter().copied().map(Value::I64).collect();
     let mut cache = HashMap::new();
-    let value = eval_node(conn, &info.root, &mut cache, &arg_values)?;
-    match value {
-        Value::I64(n) => Ok(n),
+    let value = eval_node(conn, &info.root, &mut cache, args)?;
+    let expected_ty = info.results[0];
+    if value.type_tag() != expected_ty {
+        bail!(
+            "result type mismatch: expected {:?}, got {:?}",
+            expected_ty,
+            value.type_tag()
+        );
     }
+    Ok(vec![value])
 }
 
 #[derive(Deserialize)]
@@ -53,9 +72,16 @@ struct NodeRecord {
     nk: String,
     #[serde(default)]
     #[allow(dead_code)]
-    ty: String,
+    ty: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    out: Option<Vec<String>>,
     #[serde(default, rename = "in")]
     inputs: Vec<NodeInputRecord>,
+    #[serde(default)]
+    vals: Vec<NodeInputRecord>,
+    #[serde(default)]
+    deps: Vec<NodeInputRecord>,
     #[serde(default)]
     eff: Vec<ByteBuf>,
     #[serde(rename = "pl")]
@@ -83,8 +109,22 @@ struct NodePayloadRecord {
 }
 
 #[derive(Clone, Debug)]
-enum Value {
+pub enum Value {
     I64(i64),
+    F64(f64),
+    Ptr(u64),
+    Unit,
+}
+
+impl Value {
+    fn type_tag(&self) -> TypeTag {
+        match self {
+            Value::I64(_) => TypeTag::I64,
+            Value::F64(_) => TypeTag::F64,
+            Value::Ptr(_) => TypeTag::Ptr,
+            Value::Unit => TypeTag::Unit,
+        }
+    }
 }
 
 fn eval_node(
@@ -145,14 +185,15 @@ fn eval_node(
                 .word
                 .ok_or_else(|| anyhow!("CALL node missing word payload"))?;
             let word_cid = bytebuf_to_array(&word_buf)?;
-            let call_args = inputs
-                .into_iter()
-                .map(|v| match v {
-                    Value::I64(n) => Ok(n),
-                })
-                .collect::<Result<Vec<i64>>>()?;
-            Value::I64(run_word_i64(conn, &word_cid, &call_args)?)
+            // TODO: support stack-passed quotations by dispatching without assuming
+            // eagerly inlined bodies.
+            let mut results = run_word(conn, &word_cid, &inputs)?;
+            if results.len() != 1 {
+                bail!("runner CALL support limited to single-result words");
+            }
+            results.pop().unwrap()
         }
+        "LOAD_GLOBAL" => bail!("LOAD_GLOBAL not supported by runner (yet)"),
         kind => bail!("unsupported node kind `{kind}` in runner"),
     };
 
@@ -170,6 +211,7 @@ fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) ->
         .into_iter()
         .map(|v| match v {
             Value::I64(n) => Ok(n),
+            other => bail!("primitive expects i64 inputs, got {:?}", other.type_tag()),
         })
         .collect::<Result<_>>()?;
 

@@ -375,7 +375,7 @@ fn collect_interface_rows(conn: &Connection) -> Result<Vec<InterfaceRow>> {
         let (_, cbor) = load_object_cbor(conn, &cid_bytes)?;
         let record: InterfaceRecord = serde_cbor::from_slice(&cbor)?;
         let mut summaries = Vec::new();
-        for sym in record.symbols {
+        for sym in record.names {
             let params = sym.ty.params.join(", ");
             let results = sym.ty.results.join(", ");
             let effects = sym
@@ -636,7 +636,7 @@ struct NamespaceExportRecord {
 struct InterfaceRecord {
     #[allow(dead_code)]
     kind: String,
-    symbols: Vec<InterfaceSymbolRecord>,
+    names: Vec<InterfaceSymbolRecord>,
 }
 
 #[derive(Deserialize)]

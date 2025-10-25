@@ -38,12 +38,12 @@ target/release/march5 --db demo.march5.db prim add add_i64 \
 
 By default the CLI persists the primitive object and records the name in the `name_index` under the `prim` scope.
 
-Define an interface (each `--symbol` looks like `name(param,...) -> (result,...) | effectCID,...` and you can omit the trailing section for pure symbols):
+Define an interface (each `--name` entry looks like `name(param,...) -> result,... | effectCID,...`; omit the trailing section for pure exports):
 
 ```bash
 target/release/march5 --db demo.march5.db iface add \
-  --name demo.math/iface \
-  --symbol "hello() -> unit | 9545e3adf7a49fb36233ec4555d0763b694ac65330ffb412a1c438d8ebde09ec"
+  --register demo.math/iface \
+  --name "hello() -> unit | 9545e3adf7a49fb36233ec4555d0763b694ac65330ffb412a1c438d8ebde09ec"
 ```
 
 Create a namespace that ties an interface to imported interfaces and exported words:

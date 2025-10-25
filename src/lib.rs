@@ -19,7 +19,7 @@ pub type Result<T> = anyhow::Result<T>;
 pub use builder::GraphBuilder;
 pub use effect::{EffectCanon, EffectStoreOutcome};
 pub use iface::{IfaceCanon, IfaceStoreOutcome, IfaceSymbol};
-pub use interp::run_word_i64;
+pub use interp::{Value, run_word, run_word_i64};
 pub use namespace::{NamespaceCanon, NamespaceExport, NamespaceStoreOutcome};
 pub use node::{NodeCanon, NodeInput, NodeKind, NodePayload, NodeStoreOutcome};
 pub use prim::{PrimCanon, PrimInfo, PrimStoreOutcome};

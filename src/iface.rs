@@ -16,10 +16,10 @@ pub struct IfaceSymbol {
     pub effects: Vec<[u8; 32]>,
 }
 
-/// Collection of symbols that make up an interface.
+/// Canonical list of named exports that make up an interface.
 #[derive(Clone, Debug)]
 pub struct IfaceCanon {
-    pub symbols: Vec<IfaceSymbol>,
+    pub names: Vec<IfaceSymbol>,
 }
 
 /// Result of persisting an interface object.
@@ -37,7 +37,7 @@ pub fn encode(iface: &IfaceCanon) -> Vec<u8> {
     push_text(&mut buf, "iface");
 
     push_text(&mut buf, "names");
-    encode_symbols(&mut buf, &iface.symbols);
+    encode_names(&mut buf, &iface.names);
 
     buf
 }
@@ -55,7 +55,7 @@ pub fn derive_from_exports(
     conn: &Connection,
     exports: &[(String, [u8; 32])],
 ) -> Result<IfaceCanon> {
-    let mut symbols = Vec::with_capacity(exports.len());
+    let mut names = Vec::with_capacity(exports.len());
     for (name, word_cid) in exports {
         let info = crate::word::load_word_info(conn, word_cid)?;
         let params = info
@@ -68,18 +68,18 @@ pub fn derive_from_exports(
             .iter()
             .map(|t| t.as_atom().to_string())
             .collect();
-        symbols.push(IfaceSymbol {
+        names.push(IfaceSymbol {
             name: name.clone(),
             params,
             results,
             effects: info.effects.clone(),
         });
     }
-    Ok(IfaceCanon { symbols })
+    Ok(IfaceCanon { names })
 }
 
-fn encode_symbols(buf: &mut Vec<u8>, symbols: &[IfaceSymbol]) {
-    let mut sorted = symbols.to_vec();
+fn encode_names(buf: &mut Vec<u8>, names: &[IfaceSymbol]) {
+    let mut sorted = names.to_vec();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
 
     push_array(buf, sorted.len() as u64);
@@ -115,9 +115,9 @@ mod tests {
     use crate::word::{WordCanon, store_word};
 
     #[test]
-    fn encode_iface_symbols_sorted() {
+    fn encode_iface_names_sorted() {
         let iface = IfaceCanon {
-            symbols: vec![
+            names: vec![
                 IfaceSymbol {
                     name: "world".to_string(),
                     params: vec![],
@@ -158,9 +158,9 @@ mod tests {
         };
         let outcome = store_word(&conn, &word)?;
         let iface = derive_from_exports(&conn, &[("add".into(), outcome.cid)])?;
-        assert_eq!(iface.symbols.len(), 1);
-        assert_eq!(iface.symbols[0].name, "add");
-        assert_eq!(iface.symbols[0].effects, effects);
+        assert_eq!(iface.names.len(), 1);
+        assert_eq!(iface.names[0].name, "add");
+        assert_eq!(iface.names[0].effects, effects);
         Ok(())
     }
 }

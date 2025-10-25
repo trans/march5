@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS code_cache (
 );
 
 CREATE INDEX IF NOT EXISTS object_kind_idx ON object(kind);
+CREATE INDEX IF NOT EXISTS name_scope_cid_idx ON name_index(scope, cid);
 "#;
 
     conn.execute_batch(SCHEMA)?;

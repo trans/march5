@@ -6,7 +6,7 @@
 //! wiring-only stack operations (`dup`, `swap`, `over`). Declared effects from
 //! primitives and words are accumulated so resulting nodes inherit effect sets.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
@@ -33,7 +33,7 @@ pub struct GraphBuilder<'conn> {
     param_types: Vec<TypeTag>,
     prim_cache: HashMap<[u8; 32], PrimInfo>,
     word_cache: HashMap<[u8; 32], WordInfo>,
-    accumulated_effects: BTreeSet<[u8; 32]>,
+    accumulated_effects: Vec<[u8; 32]>,
 }
 
 impl<'conn> GraphBuilder<'conn> {
@@ -45,7 +45,7 @@ impl<'conn> GraphBuilder<'conn> {
             param_types: Vec::new(),
             prim_cache: HashMap::new(),
             word_cache: HashMap::new(),
-            accumulated_effects: BTreeSet::new(),
+            accumulated_effects: Vec::new(),
         }
     }
 
@@ -58,8 +58,11 @@ impl<'conn> GraphBuilder<'conn> {
         for (idx, ty) in params.iter().enumerate() {
             let node = NodeCanon {
                 kind: NodeKind::Arg,
-                ty: ty.as_atom().to_string(),
+                ty: Some(ty.as_atom().to_string()),
+                out: vec![ty.as_atom().to_string()],
                 inputs: Vec::new(),
+                vals: Vec::new(),
+                deps: Vec::new(),
                 effects: Vec::new(),
                 payload: NodePayload::Arg(idx as u32),
             };
@@ -83,8 +86,11 @@ impl<'conn> GraphBuilder<'conn> {
     pub fn push_lit_i64(&mut self, value: i64) -> Result<[u8; 32]> {
         let node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: TypeTag::I64.as_atom().to_string(),
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
             effects: Vec::new(),
             payload: NodePayload::LitI64(value),
         };
@@ -129,25 +135,78 @@ impl<'conn> GraphBuilder<'conn> {
         Ok(())
     }
 
-    /// Apply a primitive by CID, deriving arity/result/effects from storage.
-    pub fn apply_prim(&mut self, prim_cid: [u8; 32]) -> Result<[u8; 32]> {
-        let info = self.prim_info(&prim_cid)?;
-        let arity = info.params.len();
+    /// Wire-only DROP: (x -- )
+    pub fn drop(&mut self) -> Result<()> {
+        self.stack
+            .pop()
+            .ok_or_else(|| anyhow!("stack underflow: drop"))?;
+        Ok(())
+    }
 
+    /// Wire-only NIP: (x y -- y)
+    pub fn nip(&mut self) -> Result<()> {
+        let n = self.stack.len();
+        if n < 2 {
+            bail!("stack underflow: nip");
+        }
+        self.stack.remove(n - 2);
+        Ok(())
+    }
+
+    /// Wire-only TUCK: (x y -- y x y)
+    pub fn tuck(&mut self) -> Result<()> {
+        let n = self.stack.len();
+        if n < 2 {
+            bail!("stack underflow: tuck");
+        }
+        let item = self.stack[n - 2];
+        self.stack.push(item);
+        Ok(())
+    }
+
+    /// Wire-only ROT: (x y z -- y z x)
+    pub fn rot(&mut self) -> Result<()> {
+        let n = self.stack.len();
+        if n < 3 {
+            bail!("stack underflow: rot");
+        }
+        self.stack[n - 3..].rotate_left(1);
+        Ok(())
+    }
+
+    /// Wire-only -ROT: (x y z -- z x y)
+    pub fn rot_minus(&mut self) -> Result<()> {
+        let n = self.stack.len();
+        if n < 3 {
+            bail!("stack underflow: -rot");
+        }
+        self.stack[n - 3..].rotate_right(1);
+        Ok(())
+    }
+
+    #[inline]
+    fn apply_general(
+        &mut self,
+        arity: usize,
+        params: &[TypeTag],
+        results: &[TypeTag],
+        effects: &[[u8; 32]],
+        payload: NodePayload,
+    ) -> Result<[u8; 32]> {
         let popped = self.pop_n(arity)?;
 
-        // Basic type check to avoid wiring mistakes.
-        for (i, (expected, actual)) in info.params.iter().zip(popped.iter()).enumerate() {
+        // Fast-path type check over the hot loop.
+        for (i, (expected, actual)) in params.iter().zip(popped.iter()).enumerate() {
             if expected != &actual.ty {
                 bail!(
-                    "prim argument {i} type mismatch: expected {:?}, got {:?}",
+                    "argument {i} type mismatch: expected {:?}, got {:?}",
                     expected,
                     actual.ty
                 );
             }
         }
 
-        let inputs: Vec<NodeInput> = popped
+        let inputs: SmallVec<[NodeInput; 8]> = popped
             .iter()
             .map(|item| NodeInput {
                 cid: item.cid,
@@ -155,23 +214,29 @@ impl<'conn> GraphBuilder<'conn> {
             })
             .collect();
 
-        let out_ty = info
-            .results
+        let out_ty = *results
             .get(0)
-            .copied()
-            .ok_or_else(|| anyhow!("primitive must have at least one result"))?;
+            .ok_or_else(|| anyhow!("callee must have \u{2265}1 result"))?;
+
+        let kind = match &payload {
+            NodePayload::Prim(..) => NodeKind::Prim,
+            NodePayload::Word(..) => NodeKind::Call,
+            _ => unreachable!("apply_general: Prim/Word only"),
+        };
 
         let node = NodeCanon {
-            kind: NodeKind::Prim,
-            ty: out_ty.as_atom().to_string(),
-            inputs,
-            effects: info.effects.clone(),
-            payload: NodePayload::Prim(prim_cid),
+            kind,
+            ty: Some(out_ty.as_atom().to_string()),
+            out: vec![out_ty.as_atom().to_string()],
+            inputs: inputs.into_vec(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: effects.to_vec(),
+            payload,
         };
+
         let outcome = node::store_node(self.conn, &node)?;
-        for effect in &info.effects {
-            self.accumulated_effects.insert(*effect);
-        }
+        self.accumulated_effects.extend(effects.iter().copied());
         self.stack.push(StackItem {
             cid: outcome.cid,
             port: 0,
@@ -180,53 +245,28 @@ impl<'conn> GraphBuilder<'conn> {
         Ok(outcome.cid)
     }
 
+    /// Apply a primitive by CID, deriving arity/result/effects from storage.
+    pub fn apply_prim(&mut self, prim_cid: [u8; 32]) -> Result<[u8; 32]> {
+        let info = self.prim_info(&prim_cid)?;
+        self.apply_general(
+            info.params.len(),
+            &info.params,
+            &info.results,
+            &info.effects,
+            NodePayload::Prim(prim_cid),
+        )
+    }
+
     /// Apply a word call using metadata loaded from storage.
     pub fn apply_word(&mut self, word_cid: [u8; 32]) -> Result<[u8; 32]> {
         let info = self.word_info(&word_cid)?;
-        let arity = info.params.len();
-        let popped = self.pop_n(arity)?;
-
-        for (i, (expected, actual)) in info.params.iter().zip(popped.iter()).enumerate() {
-            if expected != &actual.ty {
-                bail!(
-                    "call argument {i} type mismatch: expected {:?}, got {:?}",
-                    expected,
-                    actual.ty
-                );
-            }
-        }
-
-        let inputs: Vec<NodeInput> = popped
-            .iter()
-            .map(|item| NodeInput {
-                cid: item.cid,
-                port: item.port,
-            })
-            .collect();
-
-        let out_ty = info
-            .results
-            .get(0)
-            .copied()
-            .ok_or_else(|| anyhow!("callee must produce at least one result"))?;
-
-        let node = NodeCanon {
-            kind: NodeKind::Call,
-            ty: out_ty.as_atom().to_string(),
-            inputs,
-            effects: info.effects.clone(),
-            payload: NodePayload::Word(word_cid),
-        };
-        let outcome = node::store_node(self.conn, &node)?;
-        for effect in &info.effects {
-            self.accumulated_effects.insert(*effect);
-        }
-        self.stack.push(StackItem {
-            cid: outcome.cid,
-            port: 0,
-            ty: out_ty,
-        });
-        Ok(outcome.cid)
+        self.apply_general(
+            info.params.len(),
+            &info.params,
+            &info.results,
+            &info.effects,
+            NodePayload::Word(word_cid),
+        )
     }
 
     /// Expose the top CID without consuming it.
@@ -288,11 +328,14 @@ impl<'conn> GraphBuilder<'conn> {
             .last()
             .ok_or_else(|| anyhow!("cannot finish word without a root node"))?;
 
+        self.accumulated_effects.sort_unstable();
+        self.accumulated_effects.dedup();
+
         let word = WordCanon {
             root: root.cid,
             params: params.iter().map(|t| t.as_atom().to_string()).collect(),
             results: results.iter().map(|t| t.as_atom().to_string()).collect(),
-            effects: self.accumulated_effects.iter().copied().collect(),
+            effects: self.accumulated_effects.clone(),
         };
         let outcome = word::store_word(self.conn, &word)?;
         if let Some(name) = symbol {
@@ -403,6 +446,62 @@ mod tests {
         builder.over()?;
 
         assert_eq!(builder.depth(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn drop_nip_tuck_rot_variants() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[])?;
+
+        let cid1 = builder.push_lit_i64(1)?;
+        let cid2 = builder.push_lit_i64(2)?;
+        builder.push_lit_i64(3)?;
+
+        builder.drop()?;
+        assert_eq!(builder.stack.len(), 2);
+        assert_eq!(builder.stack[0].cid, cid1);
+        assert_eq!(builder.stack[1].cid, cid2);
+
+        let cid4 = builder.push_lit_i64(4)?;
+        builder.nip()?;
+        assert_eq!(builder.stack.len(), 2);
+        assert_eq!(builder.stack[0].cid, cid1);
+        assert_eq!(builder.stack[1].cid, cid4);
+
+        builder.tuck()?;
+        assert_eq!(builder.stack.len(), 3);
+        assert_eq!(
+            builder
+                .stack
+                .iter()
+                .map(|item| item.cid)
+                .collect::<Vec<_>>(),
+            vec![cid1, cid4, cid1]
+        );
+
+        builder.rot()?;
+        assert_eq!(
+            builder
+                .stack
+                .iter()
+                .map(|item| item.cid)
+                .collect::<Vec<_>>(),
+            vec![cid4, cid1, cid1]
+        );
+
+        builder.rot_minus()?;
+        assert_eq!(
+            builder
+                .stack
+                .iter()
+                .map(|item| item.cid)
+                .collect::<Vec<_>>(),
+            vec![cid1, cid4, cid1]
+        );
         Ok(())
     }
 }

@@ -8,25 +8,31 @@ use libc::{
 };
 use once_cell::sync::OnceCell;
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+type BinFn = unsafe extern "sysv64" fn(i64, i64) -> i64;
+
+#[cfg(not(all(target_arch = "x86_64", target_os = "linux")))]
+type BinFn = unsafe extern "C" fn(i64, i64) -> i64;
+
 const ADD_BYTES: &[u8] = &[0x48, 0x89, 0xf8, 0x48, 0x01, 0xf0, 0xc3];
 const SUB_BYTES: &[u8] = &[0x48, 0x89, 0xf8, 0x48, 0x29, 0xf0, 0xc3];
 
-static ADD_PTR: OnceCell<unsafe extern "sysv64" fn(i64, i64) -> i64> = OnceCell::new();
-static SUB_PTR: OnceCell<unsafe extern "sysv64" fn(i64, i64) -> i64> = OnceCell::new();
+static ADD_PTR: OnceCell<BinFn> = OnceCell::new();
+static SUB_PTR: OnceCell<BinFn> = OnceCell::new();
 
-pub fn compiled_add() -> Result<unsafe extern "sysv64" fn(i64, i64) -> i64> {
+pub fn compiled_add() -> Result<BinFn> {
     ADD_PTR
         .get_or_try_init(|| unsafe { load_exec_binary(ADD_BYTES) })
         .map(|f| *f)
 }
 
-pub fn compiled_sub() -> Result<unsafe extern "sysv64" fn(i64, i64) -> i64> {
+pub fn compiled_sub() -> Result<BinFn> {
     SUB_PTR
         .get_or_try_init(|| unsafe { load_exec_binary(SUB_BYTES) })
         .map(|f| *f)
 }
 
-unsafe fn load_exec_binary(bytes: &[u8]) -> Result<unsafe extern "sysv64" fn(i64, i64) -> i64> {
+unsafe fn load_exec_binary(bytes: &[u8]) -> Result<BinFn> {
     let page_size = libc::sysconf(libc::_SC_PAGESIZE) as usize;
     if page_size == 0 {
         return Err(anyhow!("sysconf(_SC_PAGESIZE) returned 0"));
@@ -49,6 +55,6 @@ unsafe fn load_exec_binary(bytes: &[u8]) -> Result<unsafe extern "sysv64" fn(i64
         munmap(ptr, alloc_len);
         return Err(anyhow!("mprotect failed"));
     }
-    let func: unsafe extern "sysv64" fn(i64, i64) -> i64 = std::mem::transmute(ptr);
+    let func: BinFn = std::mem::transmute(ptr);
     Ok(func)
 }
