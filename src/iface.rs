@@ -50,6 +50,34 @@ pub fn store_iface(conn: &Connection, iface: &IfaceCanon) -> Result<IfaceStoreOu
     Ok(IfaceStoreOutcome { cid, inserted })
 }
 
+/// Derive an interface from exported word CIDs (name, wordCID).
+pub fn derive_from_exports(
+    conn: &Connection,
+    exports: &[(String, [u8; 32])],
+) -> Result<IfaceCanon> {
+    let mut symbols = Vec::with_capacity(exports.len());
+    for (name, word_cid) in exports {
+        let info = crate::word::load_word_info(conn, word_cid)?;
+        let params = info
+            .params
+            .iter()
+            .map(|t| t.as_atom().to_string())
+            .collect();
+        let results = info
+            .results
+            .iter()
+            .map(|t| t.as_atom().to_string())
+            .collect();
+        symbols.push(IfaceSymbol {
+            name: name.clone(),
+            params,
+            results,
+            effects: info.effects.clone(),
+        });
+    }
+    Ok(IfaceCanon { symbols })
+}
+
 fn encode_symbols(buf: &mut Vec<u8>, symbols: &[IfaceSymbol]) {
     let mut sorted = symbols.to_vec();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -82,6 +110,9 @@ fn encode_symbols(buf: &mut Vec<u8>, symbols: &[IfaceSymbol]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store;
+    use crate::types::TypeTag;
+    use crate::word::{WordCanon, store_word};
 
     #[test]
     fn encode_iface_symbols_sorted() {
@@ -112,5 +143,24 @@ mod tests {
             .position(|w| w == b"world")
             .unwrap();
         assert!(hello_pos < world_pos);
+    }
+
+    #[test]
+    fn derive_interface_from_words() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+        let effects = vec![[0xAA; 32]];
+        let word = WordCanon {
+            root: [0x44; 32],
+            params: vec![TypeTag::I64.as_atom().to_string()],
+            results: vec![TypeTag::I64.as_atom().to_string()],
+            effects: effects.clone(),
+        };
+        let outcome = store_word(&conn, &word)?;
+        let iface = derive_from_exports(&conn, &[("add".into(), outcome.cid)])?;
+        assert_eq!(iface.symbols.len(), 1);
+        assert_eq!(iface.symbols[0].name, "add");
+        assert_eq!(iface.symbols[0].effects, effects);
+        Ok(())
     }
 }

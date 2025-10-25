@@ -51,16 +51,28 @@ Create a namespace that ties an interface to imported interfaces and exported wo
 ```bash
 target/release/march5 --db demo.march5.db namespace add \
   --name demo.math \
-  --iface <iface_cid> \
   --import <io_iface_cid> \
-  --export <hello_word_cid>
+  --export hello=<hello_word_cid>
 ```
+
+When `--iface` is omitted the CLI derives the interface from the exported words
+and stores it automatically.
 
 List the registered namespaces:
 
 ```bash
 target/release/march5 --db demo.march5.db namespace list --prefix demo.
 ```
+
+Launch the interactive builder to script graphs without manually wiring CIDs:
+
+```bash
+target/release/march5 --db demo.march5.db builder
+```
+
+Inside the REPL you can run commands such as `begin`, `lit`, `prim <primCID>`,
+`call <wordCID>`, `dup`, `swap`, `over`, and `finish <result> [name]`. Type
+`help` in the prompt for the full list.
 
 Create a literal node (produces a canonical node object and prints its CID):
 

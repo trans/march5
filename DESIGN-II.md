@@ -33,6 +33,9 @@ Rules:
     Sorted by `name` for determinism.
   - `interface` is this namespace’s own Interface CID (hash of its exports).
 
+When capturing exports from tooling, pass them as `symbolName=<wordCID>` pairs so the
+canonical array can be emitted deterministically while retaining the word linkage.
+
 The canonical namespace CBOR **excludes**:
   - lexical `use` aliases,
   - human-readable namespace name,
@@ -58,6 +61,10 @@ Canonicalization rules:
   - Omit empty arrays.
 
 Hashing this CBOR yields the Interface CID used in `bindings` and in the namespace `interface` field.
+
+During compilation the interface can be synthesized automatically by inspecting
+each exported word: lift its parameter/result types and accumulated effect set
+into the \`symbols\` array so the contract always mirrors the actual graph semantics.
 
 ### RAM View (Compiler-only)
 
@@ -354,4 +361,3 @@ Array entries avoid that repetition, speed up parsing, and reduce hashing ambigu
 - Add an optional, non-canonical `"doc"` field for documentation (ignored for hashing).
 - Add an optional `"deprecations"` side table (non-canonical).
 - Add `"symbols_ext"` with extra metadata; keep `"symbols"` as the canonical core.
-

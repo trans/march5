@@ -10,8 +10,14 @@ use crate::{cid, store};
 #[derive(Clone, Debug)]
 pub struct NamespaceCanon {
     pub imports: Vec<[u8; 32]>,
-    pub exports: Vec<[u8; 32]>,
+    pub exports: Vec<NamespaceExport>,
     pub iface: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub struct NamespaceExport {
+    pub name: String,
+    pub word: [u8; 32],
 }
 
 /// Result of persisting a namespace object.
@@ -32,7 +38,7 @@ pub fn encode(ns: &NamespaceCanon) -> Vec<u8> {
     encode_cid_list(&mut buf, &ns.imports);
 
     push_text(&mut buf, "exports");
-    encode_cid_list(&mut buf, &ns.exports);
+    encode_exports(&mut buf, &ns.exports);
 
     push_text(&mut buf, "iface");
     push_bytes(&mut buf, &ns.iface);
@@ -57,6 +63,19 @@ fn encode_cid_list(buf: &mut Vec<u8>, cids: &[[u8; 32]]) {
     }
 }
 
+fn encode_exports(buf: &mut Vec<u8>, exports: &[NamespaceExport]) {
+    let mut sorted = exports.to_vec();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    push_array(buf, sorted.len() as u64);
+    for export in sorted {
+        push_map(buf, 2);
+        push_text(buf, "name");
+        push_text(buf, &export.name);
+        push_text(buf, "word");
+        push_bytes(buf, &export.word);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,7 +84,16 @@ mod tests {
     fn encode_namespace_sorts_lists() {
         let ns = NamespaceCanon {
             imports: vec![[0x02; 32], [0x01; 32]],
-            exports: vec![[0x22; 32], [0x11; 32]],
+            exports: vec![
+                NamespaceExport {
+                    name: "zeta".into(),
+                    word: [0x22; 32],
+                },
+                NamespaceExport {
+                    name: "alpha".into(),
+                    word: [0x11; 32],
+                },
+            ],
             iface: [0xFF; 32],
         };
         let encoded = encode(&ns);
@@ -80,5 +108,14 @@ mod tests {
             .unwrap();
         assert!(first_import < second_import);
         assert!(encoded.iter().filter(|&&b| b == 0xFF).count() >= 32);
+        let alpha_pos = encoded
+            .windows(b"alpha".len())
+            .position(|w| w == b"alpha")
+            .unwrap();
+        let zeta_pos = encoded
+            .windows(b"zeta".len())
+            .position(|w| w == b"zeta")
+            .unwrap();
+        assert!(alpha_pos < zeta_pos);
     }
 }

@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use march5::effect::{self, EffectCanon};
 use march5::iface::{self, IfaceCanon, IfaceSymbol};
-use march5::namespace::{self, NamespaceCanon};
+use march5::namespace::{self, NamespaceCanon, NamespaceExport};
 use march5::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use march5::prim::{self, PrimCanon};
 use march5::word::{self, WordCanon};
@@ -60,6 +60,8 @@ enum Command {
         #[command(subcommand)]
         command: WordCommand,
     },
+    /// Interactive graph builder REPL
+    Builder,
 }
 
 #[derive(Subcommand)]
@@ -126,14 +128,14 @@ enum NamespaceCommand {
         /// Optional namespace name for name_index registration
         #[arg(long = "name")]
         name: Option<String>,
-        /// Interface CID satisfied by this namespace
+        /// Optional precomputed interface CID; omit to derive automatically
         #[arg(long = "iface")]
-        iface: String,
+        iface: Option<String>,
         /// Required interface CIDs for imports
         #[arg(long = "import", value_name = "CID")]
         imports: Vec<String>,
-        /// Exported word CIDs
-        #[arg(long = "export", value_name = "CID")]
+        /// Exported words as name=wordCID pairs
+        #[arg(long = "export", value_name = "NAME=CID")]
         exports: Vec<String>,
         /// Skip name registration
         #[arg(long = "no-register")]
@@ -261,6 +263,10 @@ fn run() -> Result<()> {
             let store_path = require_store_path(cli.store.as_deref())?;
             cmd_word(store_path, command)
         }
+        Command::Builder => {
+            let store_path = require_store_path(cli.store.as_deref())?;
+            cmd_builder(store_path)
+        }
     }
 }
 
@@ -381,9 +387,21 @@ fn cmd_namespace(store: &Path, command: NamespaceCommand) -> Result<()> {
             no_register,
         } => {
             let conn = open_store(store)?;
-            let iface_cid = cid::from_hex(&iface)?;
             let imports = parse_cid_list(imports.iter().map(|s| s.as_str()))?;
-            let exports = parse_cid_list(exports.iter().map(|s| s.as_str()))?;
+            let export_pairs = parse_exports(&exports)?;
+            let iface_cid = if let Some(iface_hex) = iface {
+                cid::from_hex(&iface_hex)?
+            } else {
+                let iface_canon = iface::derive_from_exports(&conn, &export_pairs)?;
+                iface::store_iface(&conn, &iface_canon)?.cid
+            };
+            let exports = export_pairs
+                .iter()
+                .map(|(name, word_cid)| NamespaceExport {
+                    name: name.clone(),
+                    word: *word_cid,
+                })
+                .collect();
             let ns = NamespaceCanon {
                 imports,
                 exports,
@@ -541,6 +559,142 @@ fn cmd_word(store: &Path, command: WordCommand) -> Result<()> {
     Ok(())
 }
 
+fn cmd_builder(store: &Path) -> Result<()> {
+    use std::io::{self, BufRead, Write};
+
+    let conn = open_store(store)?;
+    let mut builder = march5::GraphBuilder::new(&conn);
+    let stdin = io::stdin();
+    let mut input = String::new();
+    let mut current_params: Option<Vec<TypeTag>> = None;
+
+    println!(
+        "March builder REPL. Commands: begin, lit, prim, call, dup, swap, over, stack, finish, reset, help, quit."
+    );
+    loop {
+        print!("builder> ");
+        io::stdout().flush().ok();
+        input.clear();
+        if stdin.lock().read_line(&mut input)? == 0 {
+            break;
+        }
+        let line = input.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let cmd = parts.next().unwrap();
+        let remaining: Vec<&str> = parts.collect();
+
+        let result = match cmd {
+            "help" => {
+                println!(
+                    "Commands:\n  begin [types...]        start a word with parameter types (e.g. begin i64 i64)\n  lit <i64>               push literal\n  prim <primCID>          apply primitive by CID\n  call <wordCID>          call existing word by CID\n  dup|swap|over           stack shuffles\n  stack                   show current stack depth\n  finish <result> [name]  finish word with result type and optional name\n  reset                   abandon current build\n  quit/exit               leave the REPL"
+                );
+                Ok(())
+            }
+            "quit" | "exit" => break,
+            "begin" => {
+                let tags =
+                    parse_type_tags(&remaining.iter().map(|s| s.to_string()).collect::<Vec<_>>())?;
+                builder.begin_word(&tags)?;
+                current_params = Some(tags);
+                println!(
+                    "began word with {} parameter(s)",
+                    current_params.as_ref().unwrap().len()
+                );
+                Ok(())
+            }
+            "reset" => {
+                builder.begin_word(&[])?;
+                current_params = Some(Vec::new());
+                println!("state reset");
+                Ok(())
+            }
+            "lit" => {
+                ensure_builder_begun(&mut builder, &mut current_params)?;
+                if remaining.len() != 1 {
+                    bail!("lit expects one argument");
+                }
+                let value: i64 = remaining[0].parse()?;
+                builder.push_lit_i64(value)?;
+                Ok(())
+            }
+            "prim" => {
+                ensure_builder_begun(&mut builder, &mut current_params)?;
+                if remaining.len() != 1 {
+                    bail!("prim expects CID argument");
+                }
+                let cid = cid::from_hex(remaining[0])?;
+                builder.apply_prim(cid)?;
+                Ok(())
+            }
+            "call" => {
+                ensure_builder_begun(&mut builder, &mut current_params)?;
+                if remaining.len() != 1 {
+                    bail!("call expects CID argument");
+                }
+                let cid = cid::from_hex(remaining[0])?;
+                builder.apply_word(cid)?;
+                Ok(())
+            }
+            "dup" => {
+                ensure_builder_begun(&mut builder, &mut current_params)?;
+                builder.dup()
+            }
+            "swap" => {
+                ensure_builder_begun(&mut builder, &mut current_params)?;
+                builder.swap()
+            }
+            "over" => {
+                ensure_builder_begun(&mut builder, &mut current_params)?;
+                builder.over()
+            }
+            "stack" => {
+                println!("stack depth: {}", builder.depth());
+                Ok(())
+            }
+            "finish" => {
+                ensure_builder_begun(&mut builder, &mut current_params)?;
+                if remaining.is_empty() {
+                    bail!("finish requires a result type, e.g., finish i64 [name]");
+                }
+                let result_tag = TypeTag::from_atom(remaining[0])?;
+                let name = if remaining.len() > 1 {
+                    Some(remaining[1].to_string())
+                } else {
+                    None
+                };
+                let params = current_params
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("no word in progress; use begin first"))?;
+                let cid = builder.finish_word(params, &[result_tag], name.as_deref())?;
+                println!("stored word with cid {}", march5::cid::to_hex(&cid));
+                current_params = None;
+                Ok(())
+            }
+            _ => bail!("unknown command `{cmd}`; type `help`"),
+        };
+
+        if let Err(err) = result {
+            eprintln!("error: {err}");
+        }
+    }
+
+    Ok(())
+}
+
+fn ensure_builder_begun(
+    builder: &mut march5::GraphBuilder<'_>,
+    current_params: &mut Option<Vec<TypeTag>>,
+) -> Result<()> {
+    if current_params.is_none() {
+        builder.begin_word(&[])?;
+        *current_params = Some(Vec::new());
+    }
+    Ok(())
+}
+
 fn require_store_path(path: Option<&Path>) -> Result<&Path> {
     match path {
         Some(p) => Ok(p),
@@ -565,6 +719,23 @@ fn parse_attrs(entries: &[String]) -> Result<Vec<(String, String)>> {
 /// Convert CLI type atoms into `TypeTag`s.
 fn parse_type_tags(entries: &[String]) -> Result<Vec<TypeTag>> {
     entries.iter().map(|s| TypeTag::from_atom(s)).collect()
+}
+
+/// Parse export specs of the form `name=cid`.
+fn parse_exports(entries: &[String]) -> Result<Vec<(String, [u8; 32])>> {
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let Some((name, cid_hex)) = entry.split_once('=') else {
+            bail!("invalid export `{entry}`; expected name=wordCID");
+        };
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            bail!("export name cannot be empty in `{entry}`");
+        }
+        let word_cid = cid::from_hex(cid_hex.trim())?;
+        out.push((trimmed_name.to_string(), word_cid));
+    }
+    Ok(out)
 }
 
 /// Parse an iterator of hexadecimal CIDs into 32-byte arrays.
@@ -712,4 +883,25 @@ fn parse_type_list(spec: &str) -> Result<Vec<String>> {
         types.push(ty.to_string());
     }
     Ok(types)
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn parse_exports_pairs() {
+        let cid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let exports = parse_exports(&vec![format!("sum={cid}")]).unwrap();
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].0, "sum");
+        assert_eq!(march5::cid::to_hex(&exports[0].1), cid);
+    }
+
+    #[test]
+    fn parse_exports_rejects_empty_name() {
+        let cid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let err = parse_exports(&vec![format!(" ={cid}")]).unwrap_err();
+        assert!(err.to_string().contains("export name cannot be empty"));
+    }
 }

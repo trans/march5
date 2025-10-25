@@ -90,6 +90,10 @@ ifaceCID = sha256(cbor).
 
 Used for compatibility checks and binding imports.
 
+Tooling derives the interface directly from exported words: each word’s
+declared type/effect metadata is lifted into the symbol table so the interface
+automatically reflects capability requirements (e.g., `io`, `heap`).
+
 
 ## 4. Canonical Encodings (CBOR)
 
@@ -159,12 +163,16 @@ CID fields: kind,imports[].iface,exports[].word,iface.
 ```json
 {
   "kind": "namespace",
-  "imports": [ { "name": "io", "iface": "<ifaceCID_io>" } ],   // name optional in CID (exclude for dedup)
-  "exports": [ { "name": "hello", "word": "<wordCID_hello>" } ],
-  "iface": "<ifaceCID_ns>",
-  "name": "lang.march.helloworld.1"  // excluded from CID for dedup; stored in name_index
+ "imports": [ { "name": "io", "iface": "<ifaceCID_io>" } ],   // name optional in CID (exclude for dedup)
+ "exports": [ { "name": "hello", "word": "<wordCID_hello>" } ],
+ "iface": "<ifaceCID_ns>",
+ "name": "lang.march.helloworld.1"  // excluded from CID for dedup; stored in name_index
 }
 ```
+
+> **Note:** When capturing exports via tooling (CLI/REPL), specify them as
+> `symbolName=<wordCID>` pairs. This ensures the canonical `exports[]` entries
+> remain sorted by `symbolName` while keeping the word CID data intact.
 
 ### 4.5 program CBOR
 
@@ -522,4 +530,3 @@ namespace(lang.march.helloworld.1):
 This is the complete plan. Implement the storage and builder first; you’ll be able to save a word, compute its CIDs, load it, interpret it, and later drop in the JIT without changing artifacts.
 
 Do not assume there are no mistakes in this design. Voice concerns and ask about undecided design decisions when they arise.
-
