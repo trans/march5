@@ -66,6 +66,7 @@ pub fn store_word(conn: &Connection, word: &WordCanon) -> Result<WordStoreOutcom
 /// Convenience metadata for word invocations.
 #[derive(Clone, Debug)]
 pub struct WordInfo {
+    pub root: [u8; 32],
     pub params: Vec<TypeTag>,
     pub results: Vec<TypeTag>,
     pub effects: Vec<[u8; 32]>,
@@ -85,6 +86,7 @@ pub fn load_word_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<WordInf
             record.kind
         ));
     }
+    let root = bytebuf_to_array(&record.root)?;
     let params = record
         .ty
         .params
@@ -112,17 +114,27 @@ pub fn load_word_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<WordInf
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(WordInfo {
+        root,
         params,
         results,
         effects,
     })
 }
 
+fn bytebuf_to_array(buf: &ByteBuf) -> Result<[u8; 32]> {
+    let slice = buf.as_slice();
+    if slice.len() != 32 {
+        bail!("invalid CID length {}; expected 32", slice.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(slice);
+    Ok(out)
+}
+
 #[derive(Deserialize)]
 struct WordRecord {
     kind: String,
-    #[serde(default)]
-    _root: Option<ByteBuf>,
+    root: ByteBuf,
     #[serde(rename = "type")]
     ty: WordTypeRecord,
     #[serde(default)]
@@ -167,6 +179,7 @@ mod tests {
         };
         let outcome = store_word(&conn, &word)?;
         let info = load_word_info(&conn, &outcome.cid)?;
+        assert_eq!(info.root, [0x22; 32]);
         assert_eq!(info.params, vec![TypeTag::I64]);
         assert_eq!(info.results, vec![TypeTag::I64]);
         assert_eq!(info.effects.len(), 1);

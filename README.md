@@ -82,6 +82,12 @@ cargo run --bin webui -- --db demo.march5.db --listen 127.0.0.1:8080
 
 Visit `http://127.0.0.1:8080/` for a simple index page and JSON API hints.
 
+Run a zero-argument `i64` word directly from the CLI:
+
+```bash
+cargo run --bin march5 -- --db examples/helloworld.march5.db run org.march.helloworld/hello
+```
+
 Create a literal node (produces a canonical node object and prints its CID):
 
 ```bash

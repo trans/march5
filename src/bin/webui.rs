@@ -7,7 +7,7 @@ use march5::prim::load_prim_info;
 use march5::word::load_word_info;
 use march5::{TypeTag, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
 use serde_json::json;

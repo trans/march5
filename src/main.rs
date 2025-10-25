@@ -12,6 +12,7 @@ use march5::prim::{self, PrimCanon};
 use march5::word::{self, WordCanon};
 use march5::{
     TypeTag, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store, put_name,
+    run_word_i64,
 };
 
 #[derive(Parser)]
@@ -64,6 +65,8 @@ enum Command {
     },
     /// Interactive graph builder REPL
     Builder,
+    /// Execute a word and print its result (currently supports i64 literals only)
+    Run { name: String },
 }
 
 #[derive(Subcommand)]
@@ -274,6 +277,10 @@ fn run() -> Result<()> {
         Command::Builder => {
             let store_path = require_store_path(cli.store.as_deref())?;
             cmd_builder(store_path)
+        }
+        Command::Run { name } => {
+            let store_path = require_store_path(cli.store.as_deref())?;
+            cmd_run(store_path, &name)
         }
     }
 }
@@ -712,6 +719,15 @@ fn ensure_builder_begun(
         builder.begin_word(&[])?;
         *current_params = Some(Vec::new());
     }
+    Ok(())
+}
+
+fn cmd_run(store: &Path, name: &str) -> Result<()> {
+    let conn = open_store(store)?;
+    let word_cid =
+        get_name(&conn, "word", name)?.ok_or_else(|| anyhow!("word `{name}` not found"))?;
+    let result = run_word_i64(&conn, &word_cid)?;
+    println!("{result}");
     Ok(())
 }
 
