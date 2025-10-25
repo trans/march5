@@ -4,6 +4,7 @@ pub mod builder;
 pub mod cbor;
 pub mod cid;
 pub mod effect;
+pub mod exec;
 pub mod iface;
 pub mod interp;
 pub mod namespace;

@@ -5,6 +5,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
 
+use crate::exec::{compiled_add, compiled_sub};
 use crate::prim::load_prim_info;
 use crate::word::load_word_info;
 use crate::{TypeTag, cid, list_names_for_cid, load_object_cbor};
@@ -114,9 +115,9 @@ fn eval_node(
             let index = record
                 .payload
                 .arg
-                .ok_or_else(|| anyhow!("ARG node missing index payload"))? as usize;
-            args
-                .get(index)
+                .ok_or_else(|| anyhow!("ARG node missing index payload"))?
+                as usize;
+            args.get(index)
                 .cloned()
                 .ok_or_else(|| anyhow!("argument {index} not supplied"))?
         }
@@ -178,14 +179,20 @@ fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) ->
             if ints.len() != 2 {
                 bail!("add_i64 expects 2 arguments, got {}", ints.len());
             }
-            Value::I64(ints[0] + ints[1])
+            match compiled_add() {
+                Ok(func) => unsafe { Value::I64(func(ints[0], ints[1])) },
+                Err(_) => Value::I64(ints[0] + ints[1]),
+            }
         }
         Some("sub_i64") => {
             require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
             if ints.len() != 2 {
                 bail!("sub_i64 expects 2 arguments, got {}", ints.len());
             }
-            Value::I64(ints[0] - ints[1])
+            match compiled_sub() {
+                Ok(func) => unsafe { Value::I64(func(ints[0], ints[1])) },
+                Err(_) => Value::I64(ints[0] - ints[1]),
+            }
         }
         Some(other) => bail!("primitive `{other}` not supported in runner"),
         None => bail!(
