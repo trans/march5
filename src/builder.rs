@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
+use smallvec::SmallVec;
 
 use crate::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use crate::prim::{self, PrimInfo};
@@ -18,7 +19,7 @@ use crate::types::TypeTag;
 use crate::word::{self, WordCanon, WordInfo};
 
 /// Stack items track the producer CID, output port, and type.
-#[derive(Clone, Debug)]
+#[derive(Copy, Clone, Debug)]
 struct StackItem {
     cid: [u8; 32],
     port: u32,
@@ -133,19 +134,7 @@ impl<'conn> GraphBuilder<'conn> {
         let info = self.prim_info(&prim_cid)?;
         let arity = info.params.len();
 
-        if self.stack.len() < arity {
-            bail!(
-                "stack underflow: prim needs {arity} values, have {}",
-                self.stack.len()
-            );
-        }
-
-        // Pop inputs (right-to-left), then reverse for left-to-right wiring.
-        let mut popped: Vec<StackItem> = Vec::with_capacity(arity);
-        for _ in 0..arity {
-            popped.push(self.stack.pop().expect("checked stack depth"));
-        }
-        popped.reverse();
+        let popped = self.pop_n(arity)?;
 
         // Basic type check to avoid wiring mistakes.
         for (i, (expected, actual)) in info.params.iter().zip(popped.iter()).enumerate() {
@@ -195,18 +184,7 @@ impl<'conn> GraphBuilder<'conn> {
     pub fn apply_word(&mut self, word_cid: [u8; 32]) -> Result<[u8; 32]> {
         let info = self.word_info(&word_cid)?;
         let arity = info.params.len();
-        if self.stack.len() < arity {
-            bail!(
-                "stack underflow: call needs {arity} values, have {}",
-                self.stack.len()
-            );
-        }
-
-        let mut popped: Vec<StackItem> = Vec::with_capacity(arity);
-        for _ in 0..arity {
-            popped.push(self.stack.pop().expect("checked stack depth"));
-        }
-        popped.reverse();
+        let popped = self.pop_n(arity)?;
 
         for (i, (expected, actual)) in info.params.iter().zip(popped.iter()).enumerate() {
             if expected != &actual.ty {
@@ -325,6 +303,24 @@ impl<'conn> GraphBuilder<'conn> {
         self.param_types.clear();
         self.accumulated_effects.clear();
         Ok(outcome.cid)
+    }
+
+    #[inline]
+    fn pop_n(&mut self, count: usize) -> Result<SmallVec<[StackItem; 8]>> {
+        if self.stack.len() < count {
+            bail!(
+                "stack underflow: need {count} value(s), have {}",
+                self.stack.len()
+            );
+        }
+        let mut out = SmallVec::<[StackItem; 8]>::with_capacity(count);
+        for _ in 0..count {
+            let item = *self.stack.last().expect("checked length");
+            self.stack.pop();
+            out.push(item);
+        }
+        out.reverse();
+        Ok(out)
     }
 
     fn prim_info(&mut self, cid: &[u8; 32]) -> Result<PrimInfo> {
