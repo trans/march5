@@ -1,11 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
-use march5::{cid, create_store, derive_db_path, get_name, load_object_cbor, open_store};
-use rusqlite::params;
+use march5::prim::load_prim_info;
+use march5::word::load_word_info;
+use march5::{TypeTag, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
+use rusqlite::{params, Connection};
+use serde::Deserialize;
+use serde_bytes::ByteBuf;
 use serde_json::json;
+use std::fmt::Write as FmtWrite;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 #[derive(Parser, Debug)]
@@ -60,7 +66,13 @@ fn handle_request(db_path: &Path, request: Request) -> Result<()> {
     let (path, query) = split_query(url);
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let response = match segments.as_slice() {
-        [] | [""] => html_response(index_page()),
+        [] | [""] => match open_store(db_path) {
+            Ok(conn) => match build_index_html(&conn) {
+                Ok(html) => html_response(html),
+                Err(err) => error_response(500, err),
+            },
+            Err(err) => error_response(500, err),
+        },
         ["api", "iface", rest @ ..] if !rest.is_empty() => {
             let name = rest.join("/");
             match fetch_named_json(db_path, "iface", "interface", &name) {
@@ -131,36 +143,460 @@ fn list_scope_entries(db_path: &Path, scope: &str, prefix: Option<&str>) -> Resu
     Ok(serde_json::to_string_pretty(&entries)?)
 }
 
-fn index_page() -> String {
-    r#"<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <title>March α₅ Web UI</title>
-    <style>
-      body { font-family: sans-serif; margin: 2rem; }
-      pre { background: #f4f4f4; padding: 1rem; overflow-x: auto; }
-      section { margin-bottom: 2rem; }
-      input[type=text] { width: 280px; }
-    </style>
-  </head>
-  <body>
-    <h1>March α₅ Web UI</h1>
-    <section>
-      <h2>Helpful Endpoints</h2>
-      <ul>
-        <li><code>/api/list/iface?prefix=demo</code></li>
-        <li><code>/api/iface/demo.math/iface</code></li>
-        <li><code>/api/list/namespace</code></li>
-        <li><code>/api/namespace/demo.math</code></li>
-        <li><code>/api/list/word?prefix=demo.math/</code></li>
-        <li><code>/api/word/demo.math/difference</code></li>
-      </ul>
-    </section>
-  </body>
-</html>
-"#
-    .to_string()
+fn build_index_html(conn: &Connection) -> Result<String> {
+    let namespaces = collect_namespace_rows(conn)?;
+    let interfaces = collect_interface_rows(conn)?;
+    let words = collect_word_rows(conn)?;
+    let prims = collect_prim_rows(conn)?;
+
+    let mut html = String::new();
+    html.push_str(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\" /><title>March α₅ Web UI</title>",
+    );
+    html.push_str(
+        "<style>body{font-family:sans-serif;margin:2rem;}table.grid{border-collapse:collapse;margin-bottom:1.5rem;}table.grid th,table.grid td{border:1px solid #ccc;padding:0.35rem 0.6rem;text-align:left;}section{margin-bottom:2rem;}h2{margin-top:1.5rem;}code{background:#f4f4f4;padding:0.15rem 0.35rem;border-radius:4px;}</style>",
+    );
+    html.push_str("</head><body><h1>March α₅ Web UI</h1>");
+
+    html.push_str(render_namespace_section(&namespaces).as_str());
+    html.push_str(render_interface_section(&interfaces).as_str());
+    html.push_str(render_word_section(&words).as_str());
+    html.push_str(render_prim_section(&prims).as_str());
+
+    html.push_str("</body></html>");
+    Ok(html)
+}
+
+fn render_namespace_section(rows: &[NamespaceRow]) -> String {
+    let mut out = String::new();
+    out.push_str("<section><h2>Namespaces</h2>");
+    if rows.is_empty() {
+        out.push_str("<p>No namespaces registered.</p></section>");
+        return out;
+    }
+    out.push_str("<table class=\"grid\"><thead><tr><th>Name</th><th>CID</th><th>Interface</th><th>Exports</th><th>Imports</th></tr></thead><tbody>");
+    for row in rows {
+        let _ = write!(
+            out,
+            "<tr><td><a href=\"{}\">{}</a></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+            make_api_href("namespace", &row.name),
+            escape_html(&row.name),
+            escape_html(&row.cid_hex),
+            escape_html(&row.iface_hex),
+            render_namespace_exports(&row.exports),
+            render_list(&row.imports)
+        );
+    }
+    out.push_str("</tbody></table></section>");
+    out
+}
+
+fn render_interface_section(rows: &[InterfaceRow]) -> String {
+    let mut out = String::new();
+    out.push_str("<section><h2>Interfaces</h2>");
+    if rows.is_empty() {
+        out.push_str("<p>No interfaces registered.</p></section>");
+        return out;
+    }
+    out.push_str("<table class=\"grid\"><thead><tr><th>Name</th><th>CID</th><th>Symbols</th></tr></thead><tbody>");
+    for row in rows {
+        let _ = write!(
+            out,
+            "<tr><td><a href=\"{}\">{}</a></td><td><code>{}</code></td><td>{}</td></tr>",
+            make_api_href("iface", &row.name),
+            escape_html(&row.name),
+            escape_html(&row.cid_hex),
+            render_list(&row.symbol_summaries)
+        );
+    }
+    out.push_str("</tbody></table></section>");
+    out
+}
+
+fn render_word_section(rows: &[WordRow]) -> String {
+    let mut out = String::new();
+    out.push_str("<section><h2>Words</h2>");
+    if rows.is_empty() {
+        out.push_str("<p>No words registered.</p></section>");
+        return out;
+    }
+    out.push_str("<table class=\"grid\"><thead><tr><th>Name</th><th>CID</th><th>Signature</th><th>Effects</th></tr></thead><tbody>");
+    for row in rows {
+        let _ = write!(
+            out,
+            "<tr><td><a href=\"{}\">{}</a></td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+            make_api_href("word", &row.name),
+            escape_html(&row.name),
+            escape_html(&row.cid_hex),
+            escape_html(&row.signature),
+            escape_html(&render_effects(&row.effects))
+        );
+    }
+    out.push_str("</tbody></table></section>");
+    out
+}
+
+fn render_prim_section(rows: &[PrimRow]) -> String {
+    let mut out = String::new();
+    out.push_str("<section><h2>Primitives</h2>");
+    if rows.is_empty() {
+        out.push_str("<p>No primitives registered.</p></section>");
+        return out;
+    }
+    out.push_str("<table class=\"grid\"><thead><tr><th>Name</th><th>CID</th><th>Signature</th><th>Effects</th></tr></thead><tbody>");
+    for row in rows {
+        let _ = write!(
+            out,
+            "<tr><td><a href=\"{}\">{}</a></td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+            make_api_href("prim", &row.name),
+            escape_html(&row.name),
+            escape_html(&row.cid_hex),
+            escape_html(&row.signature),
+            escape_html(&render_effects(&row.effects))
+        );
+    }
+    out.push_str("</tbody></table></section>");
+    out
+}
+
+#[derive(Debug)]
+struct NamespaceRow {
+    name: String,
+    cid_hex: String,
+    iface_hex: String,
+    exports: Vec<NsExport>,
+    imports: Vec<String>,
+}
+
+#[derive(Debug)]
+struct NsExport {
+    alias: String,
+    word_cid_hex: String,
+    word_name: Option<String>,
+}
+
+#[derive(Debug)]
+struct InterfaceRow {
+    name: String,
+    cid_hex: String,
+    symbol_summaries: Vec<String>,
+}
+
+#[derive(Debug)]
+struct WordRow {
+    name: String,
+    cid_hex: String,
+    signature: String,
+    effects: Vec<String>,
+}
+
+#[derive(Debug)]
+struct PrimRow {
+    name: String,
+    cid_hex: String,
+    signature: String,
+    effects: Vec<String>,
+}
+
+const SEGMENT_ENCODE: &AsciiSet = &CONTROLS
+    .add(b' ') // space
+    .add(b'"')
+    .add(b'\'')
+    .add(b'`')
+    .add(b'<')
+    .add(b'>')
+    .add(b'#')
+    .add(b'?')
+    .add(b'{')
+    .add(b'}');
+
+fn collect_namespace_rows(conn: &Connection) -> Result<Vec<NamespaceRow>> {
+    let mut stmt =
+        conn.prepare("SELECT name, cid FROM name_index WHERE scope = 'namespace' ORDER BY name")?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        Ok((name, blob))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (name, cid_blob) = row?;
+        let cid_bytes = cid::from_slice(&cid_blob)?;
+        let (_, cbor) = load_object_cbor(conn, &cid_bytes)?;
+        let record: NamespaceRecord = serde_cbor::from_slice(&cbor)?;
+        let iface_hex = cid::to_hex(&bytebuf_to_array(&record.iface)?);
+        let exports = record
+            .exports
+            .into_iter()
+            .map(|e| {
+                let word_arr = bytebuf_to_array(&e.word)?;
+                let word_cid_hex = cid::to_hex(&word_arr);
+                let word_name = lookup_names_for_cid(conn, "word", &word_arr)?
+                    .into_iter()
+                    .next();
+                Ok(NsExport {
+                    alias: e.name,
+                    word_cid_hex,
+                    word_name,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let imports = record
+            .imports
+            .into_iter()
+            .map(|buf| Ok(cid::to_hex(&bytebuf_to_array(&buf)?)))
+            .collect::<Result<Vec<_>>>()?;
+        out.push(NamespaceRow {
+            name,
+            cid_hex: cid::to_hex(&cid_bytes),
+            iface_hex,
+            exports,
+            imports,
+        });
+    }
+    Ok(out)
+}
+
+fn collect_interface_rows(conn: &Connection) -> Result<Vec<InterfaceRow>> {
+    let mut stmt =
+        conn.prepare("SELECT name, cid FROM name_index WHERE scope = 'iface' ORDER BY name")?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        Ok((name, blob))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (name, cid_blob) = row?;
+        let cid_bytes = cid::from_slice(&cid_blob)?;
+        let (_, cbor) = load_object_cbor(conn, &cid_bytes)?;
+        let record: InterfaceRecord = serde_cbor::from_slice(&cbor)?;
+        let mut summaries = Vec::new();
+        for sym in record.symbols {
+            let params = sym.ty.params.join(", ");
+            let results = sym.ty.results.join(", ");
+            let effects = sym
+                .effects
+                .into_iter()
+                .map(|buf| Ok(cid::to_hex(&bytebuf_to_array(&buf)?)))
+                .collect::<Result<Vec<_>>>()?;
+            let effect_str = render_effects(&effects);
+            let summary = if effect_str == "pure" {
+                format!("{}({}) → ({})", sym.name, params, results)
+            } else {
+                format!("{}({}) → ({}) [{}]", sym.name, params, results, effect_str)
+            };
+            summaries.push(summary);
+        }
+        out.push(InterfaceRow {
+            name,
+            cid_hex: cid::to_hex(&cid_bytes),
+            symbol_summaries: summaries,
+        });
+    }
+    Ok(out)
+}
+
+fn collect_word_rows(conn: &Connection) -> Result<Vec<WordRow>> {
+    let mut stmt =
+        conn.prepare("SELECT name, cid FROM name_index WHERE scope = 'word' ORDER BY name")?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        Ok((name, blob))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (name, cid_blob) = row?;
+        let cid_bytes = cid::from_slice(&cid_blob)?;
+        let info = load_word_info(conn, &cid_bytes)?;
+        let signature = format_signature(&info.params, &info.results);
+        let effects = info
+            .effects
+            .into_iter()
+            .map(|cid| cid::to_hex(&cid))
+            .collect();
+        out.push(WordRow {
+            name,
+            cid_hex: cid::to_hex(&cid_bytes),
+            signature,
+            effects,
+        });
+    }
+    Ok(out)
+}
+
+fn collect_prim_rows(conn: &Connection) -> Result<Vec<PrimRow>> {
+    let mut stmt =
+        conn.prepare("SELECT name, cid FROM name_index WHERE scope = 'prim' ORDER BY name")?;
+    let rows = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        Ok((name, blob))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (name, cid_blob) = row?;
+        let cid_bytes = cid::from_slice(&cid_blob)?;
+        let info = load_prim_info(conn, &cid_bytes)?;
+        let signature = format_signature(&info.params, &info.results);
+        let effects = info
+            .effects
+            .into_iter()
+            .map(|cid| cid::to_hex(&cid))
+            .collect();
+        out.push(PrimRow {
+            name,
+            cid_hex: cid::to_hex(&cid_bytes),
+            signature,
+            effects,
+        });
+    }
+    Ok(out)
+}
+
+fn render_namespace_exports(exports: &[NsExport]) -> String {
+    if exports.is_empty() {
+        return "<em>none</em>".to_string();
+    }
+    let mut out = String::new();
+    for export in exports {
+        let target_display = if let Some(fqn) = &export.word_name {
+            format!(
+                "<a href=\"{}\">{}</a>",
+                make_api_href("word", fqn),
+                escape_html(fqn)
+            )
+        } else {
+            format!("<code>{}</code>", escape_html(&export.word_cid_hex))
+        };
+        let _ = write!(
+            out,
+            "<div>{} → {}</div>",
+            escape_html(&export.alias),
+            target_display
+        );
+    }
+    out
+}
+
+fn render_list(items: &[String]) -> String {
+    if items.is_empty() {
+        return "<em>none</em>".to_string();
+    }
+    let mut out = String::new();
+    for item in items {
+        let _ = write!(out, "<div>{}</div>", escape_html(item));
+    }
+    out
+}
+
+fn render_effects(effects: &[String]) -> String {
+    if effects.is_empty() {
+        "pure".to_string()
+    } else {
+        effects.join(", ")
+    }
+}
+
+fn format_signature(params: &[TypeTag], results: &[TypeTag]) -> String {
+    let param_list = params
+        .iter()
+        .map(|t| t.as_atom())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let result_list = results
+        .iter()
+        .map(|t| t.as_atom())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({}) → ({})", param_list, result_list)
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            '<' => "&lt;".into(),
+            '>' => "&gt;".into(),
+            '&' => "&amp;".into(),
+            '"' => "&quot;".into(),
+            '\'' => "&#39;".into(),
+            _ => c.to_string(),
+        })
+        .collect()
+}
+
+fn make_api_href(scope: &str, name: &str) -> String {
+    let encoded = name
+        .split('/')
+        .map(|segment| utf8_percent_encode(segment, SEGMENT_ENCODE).to_string())
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("/api/{}/{}", scope, encoded)
+}
+
+fn bytebuf_to_array(buf: &ByteBuf) -> Result<[u8; 32]> {
+    let slice = buf.as_slice();
+    if slice.len() != 32 {
+        bail!("expected 32-byte CID, found {} bytes", slice.len());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(slice);
+    Ok(out)
+}
+
+fn lookup_names_for_cid(conn: &Connection, scope: &str, cid: &[u8; 32]) -> Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT name FROM name_index WHERE scope = ?1 AND cid = ?2 ORDER BY name")?;
+    let mut rows = stmt.query(params![scope, &cid[..]])?;
+    let mut names = Vec::new();
+    while let Some(row) = rows.next()? {
+        names.push(row.get(0)?);
+    }
+    Ok(names)
+}
+
+#[derive(Deserialize)]
+struct NamespaceRecord {
+    #[allow(dead_code)]
+    kind: String,
+    #[serde(default)]
+    imports: Vec<ByteBuf>,
+    exports: Vec<NamespaceExportRecord>,
+    iface: ByteBuf,
+}
+
+#[derive(Deserialize)]
+struct NamespaceExportRecord {
+    name: String,
+    word: ByteBuf,
+}
+
+#[derive(Deserialize)]
+struct InterfaceRecord {
+    #[allow(dead_code)]
+    kind: String,
+    symbols: Vec<InterfaceSymbolRecord>,
+}
+
+#[derive(Deserialize)]
+struct InterfaceSymbolRecord {
+    name: String,
+    #[serde(rename = "type")]
+    ty: InterfaceTypeRecord,
+    #[serde(default)]
+    effects: Vec<ByteBuf>,
+}
+
+#[derive(Deserialize)]
+struct InterfaceTypeRecord {
+    params: Vec<String>,
+    results: Vec<String>,
 }
 
 fn html_response(body: String) -> Response<std::io::Cursor<Vec<u8>>> {
