@@ -13,7 +13,8 @@ use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rusqlite::{Connection, params};
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
-use serde_json::json;
+use serde_cbor::Value as CborValue;
+use serde_json::{Map as JsonMap, Value as JsonValue, json};
 use std::fmt::Write as FmtWrite;
 use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
@@ -116,13 +117,10 @@ fn fetch_named_json(db_path: &Path, scope: &str, label: &str, name: &str) -> Res
     let cid_bytes =
         get_name(&conn, scope, name)?.ok_or_else(|| anyhow!("{label} `{name}` not found"))?;
     let (kind, cbor) = load_object_cbor(&conn, &cid_bytes)?;
-    let mut value: serde_json::Value = serde_cbor::from_slice(&cbor)?;
-    if let serde_json::Value::Object(ref mut map) = value {
-        map.insert(
-            "_cid".into(),
-            serde_json::Value::String(cid::to_hex(&cid_bytes)),
-        );
-        map.insert("_kind".into(), serde_json::Value::String(kind));
+    let mut value = cbor_to_json(&cbor)?;
+    if let JsonValue::Object(ref mut map) = value {
+        map.insert("_cid".into(), JsonValue::String(cid::to_hex(&cid_bytes)));
+        map.insert("_kind".into(), JsonValue::String(kind));
     }
     Ok(serde_json::to_string_pretty(&value)?)
 }
@@ -551,6 +549,71 @@ fn bytebuf_to_array(buf: &ByteBuf) -> Result<[u8; 32]> {
     let mut out = [0u8; 32];
     out.copy_from_slice(slice);
     Ok(out)
+}
+
+fn cbor_to_json(bytes: &[u8]) -> Result<JsonValue> {
+    let value: CborValue = serde_cbor::from_slice(bytes)?;
+    Ok(cbor_value_to_json(value))
+}
+
+fn cbor_value_to_json(value: CborValue) -> JsonValue {
+    match value {
+        CborValue::Null => JsonValue::Null,
+        CborValue::Bool(b) => JsonValue::Bool(b),
+        CborValue::Integer(i) => {
+            if let Some(v) = i64::try_from(i).ok() {
+                JsonValue::from(v)
+            } else if let Some(v) = u64::try_from(i).ok() {
+                JsonValue::from(v)
+            } else {
+                JsonValue::String(i128::from(i).to_string())
+            }
+        }
+        CborValue::Float(f) => {
+            if f.is_finite() {
+                JsonValue::from(f)
+            } else {
+                JsonValue::Null
+            }
+        }
+        CborValue::Bytes(bytes) => JsonValue::String(bytes_to_hex(&bytes)),
+        CborValue::Text(s) => JsonValue::String(s),
+        CborValue::Array(items) => {
+            JsonValue::Array(items.into_iter().map(cbor_value_to_json).collect())
+        }
+        CborValue::Map(entries) => {
+            let mut map = JsonMap::new();
+            for (k, v) in entries {
+                let key = match k {
+                    CborValue::Text(s) => s,
+                    CborValue::Integer(i) => {
+                        if let Some(val) = i64::try_from(i).ok() {
+                            val.to_string()
+                        } else if let Some(val) = u64::try_from(i).ok() {
+                            val.to_string()
+                        } else {
+                            format!("{:?}", i)
+                        }
+                    }
+                    other => format!("{:?}", other),
+                };
+                map.insert(key, cbor_value_to_json(v));
+            }
+            JsonValue::Object(map)
+        }
+        CborValue::Tag(_, boxed) => cbor_value_to_json(*boxed),
+        _ => JsonValue::Null,
+    }
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0F) as usize] as char);
+    }
+    out
 }
 
 #[derive(Deserialize)]
