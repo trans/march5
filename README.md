@@ -74,6 +74,14 @@ Inside the REPL you can run commands such as `begin`, `lit`, `prim <primCID>`,
 `call <wordCID>`, `dup`, `swap`, `over`, and `finish <result> [name]`. Type
 `help` in the prompt for the full list.
 
+Start the lightweight web UI (serves HTML + JSON endpoints):
+
+```bash
+cargo run --bin webui -- --db demo.march5.db --listen 127.0.0.1:8080
+```
+
+Visit `http://127.0.0.1:8080/` for a simple index page and JSON API hints.
+
 Create a literal node (produces a canonical node object and prints its CID):
 
 ```bash
