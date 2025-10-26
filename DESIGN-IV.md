@@ -266,7 +266,7 @@ If you use FRAME explicitly:
 
 ---------------------------------------------------------------------------
 
-APPENDIX I: Durability & Checkpointing (0.1)
+## APPENDIX I: Durability & Checkpointing (0.1)
 
 DurabilityFlag := V | B | D  ; Volatile, Buffered, Durable
 
@@ -320,7 +320,7 @@ CTX_PERSIST(D)  ; dynamic scope switch (optional sugar)
     - Sets default DurabilityFlag for nested STOREs (until scope ends).
 
 
-APPENDIX II: Constraint Agents (0.1)
+## APPENDIX II: Constraint Agents (0.1)
 
 ConstraintBundle := map varid → (lb:int64 = -∞, ub:int64 = +∞)   -- types can't be this limited, shoudl be all numbers
 
@@ -352,5 +352,121 @@ EPOCHCHECK(min_epoch)
   Ports: RTOKEN[state,epoch] in/out, k_ok, k_deopt
   Semantics: if epoch ≥ min_epoch → k_ok else k_deopt
 
+
+## APPENDIX III: Testing, Tracing, and Logging Agents (0.1)
+
+DOMAINS
+- io        : for user-visible logs/prints
+- test      : (optional) for test event streams independent of io
+- metrics   : (optional) for in-memory counters/gauges
+
+CORE UTILITIES
+
+TEE
+  Ports: val_in, val_out, tap_out, k
+  Semantics: duplicates value; tap_out feeds probes/loggers; val_out continues computation.
+  Effects: pure (no tokens required).
+
+ERASE
+  Ports: in..., k
+  Semantics: discards its inputs and continues; used to strip logs in release.
+
+ASSERT / EXPECT
+
+EXPECT_EQ
+  Ports: actual_in, expected_in, RTOKEN[state]? (optional if reading state), 
+         IOTOKEN(io)? (if printing immediately),
+         TESTTOKEN(test)? (if emitting event),
+         k
+  Semantics:
+    - Compare actual vs expected.
+    - On pass: optionally emit TestEvent(pass) to TESTTOKEN or nothing.
+    - On fail: emit TestEvent(fail, diff) and, if IOTOKEN present, also LOG a human message.
+  Effects:
+    - If only TESTTOKEN is used, does not require IOTOKEN.
+    - If printing user-visible output, requires IOTOKEN(io).
+
+EXPECT_PRED(pred-id)
+  Ports: val_in, [additional args], IOTOKEN?/TESTTOKEN?, k
+  Semantics: applies predicate; behaves like EXPECT_EQ on pass/fail.
+
+ASSERT_EQ / ASSERT_PRED
+  Same as EXPECT_*, but on fail route to FAIL or DEOPT as configured.
+
+LOGGING
+
+LOG
+  Ports: IOTOKEN(io) in/out, msg_in (str), payload_in (any, optional), k
+  Semantics: formats and writes a line to stdout/stderr. Sequenced by IOTOKEN.
+
+LOGF(level)
+  Ports: IOTOKEN(io) in/out, fmt_in (str), args_tuple_in, k
+  Semantics: printf-style structured log. May be guarded by LOG_LEVEL.
+
+TRACE(tag)
+  Ports: TESTTOKEN(test) in/out, payload_in, k
+  Semantics: append (tag, payload, timestamp?) to test event stream (in-memory). No user IO.
+
+METRICS
+
+COUNTER_ADD(tag, delta)
+  Ports: METOKEN(metrics) in/out, k
+  Semantics: increments counter[tag] by delta in-memory.
+
+GAUGE_SET(tag, value)
+  Ports: METOKEN(metrics) in/out, k
+  Semantics: sets gauge[tag] = value in-memory.
+
+CHECKPOINT_METRICS (optional)
+  Ports: METOKEN(metrics) in/out, IOTOKEN(io)? in/out, k
+  Semantics: flush metrics to log or backend on demand.
+
+PROBING & SNAPSHOTS
+
+PROBE(tag)
+  Ports: val_in, TESTTOKEN(test)? in/out, k, val_out
+  Semantics: forwards val to val_out; optionally emits (tag,val) to test stream.
+  Effects: pure if no TESTTOKEN attached.
+
+SNAPSHOT_STATE
+  Ports: RTOKEN[state] in/out, TESTTOKEN(test)? in/out, key_range?, k
+  Semantics: reads a selection of keys; emits (key,val) events to test stream.
+
+CONFIG & GUARDS
+
+LOG_LEVEL(level)
+  Ports: k_on, k_off
+  Semantics: compile/runtime guard. If current level >= level → k_on else k_off.
+
+TEST_MODE(on_off)
+  Ports: k_on, k_off
+  Semantics: enables/disables tests. In release builds rewrite test/log nodes to ERASE.
+
+REWRITE SUGGESTIONS
+
+- In release:
+  * LOG, TRACE, PROBE → ERASE (if configured)
+  * EXPECT_* → ERASE (or keep as ASSERT_* only)
+  * COUNTER_ADD/GAUGE_SET may persist (low overhead) or ERASE
+
+- In debug:
+  * LOG/TRACE sequenced by IOTOKEN/TESTTOKEN
+  * EXPECT_* never alters value flow; only produces events/prints
+
+
+### Practical wiring tips
+
+* Put a TEE before critical transforms: val → TEE → (val to compute) + (tap to LOG/TRACE).
+* Keep EXPECT_* after a computation node and before side effects you test; this keeps causality clear.=
+* For high-volume logs, prefer TRACE into an in-memory ring buffer (no io token), and flush periodically with a single LOG or on error.
+* Use LOG_LEVEL/TEST_MODE to rewrite logs/asserts to ERASE at build time (or via GUARD at runtime).
+
+### How this interacts with tokens & specialization
+
+* Logging that prints uses the io token; it naturally serializes with any other IO.
+* Test probes that don’t print can run without tokens (pure) or with a dedicated test token if you want ordering.
+* GUARD/DEOPT specialization is unaffected; at hot sites you can strip or hoist logs with a peephole pass.
+
+---------------------------------------------------------------------------
 END OF SPEC
 
