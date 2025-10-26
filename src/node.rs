@@ -9,7 +9,7 @@ use crate::cbor::{push_array, push_bytes, push_i64, push_map, push_text, push_u3
 use crate::{cid, store};
 
 /// Reference to another node's output.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct NodeInput {
     /// Producer node CID.
     pub cid: [u8; 32],
@@ -31,6 +31,17 @@ pub enum NodePayload {
         qid: [u8; 32],
         type_key: Option<[u8; 32]>,
     },
+    If {
+        true_cont: NodeInput,
+        false_cont: NodeInput,
+    },
+    Token,
+    Guard {
+        type_key: [u8; 32],
+        match_cont: NodeInput,
+        else_cont: NodeInput,
+    },
+    Deopt,
     Empty,
 }
 
@@ -47,6 +58,10 @@ pub enum NodeKind {
     Unpair,
     Quote,
     Apply,
+    If,
+    Token,
+    Guard,
+    Deopt,
 }
 
 /// Fully described node ready for canonical encoding.
@@ -112,6 +127,10 @@ pub fn encode(node: &NodeCanon) -> Result<Vec<u8>> {
             NodeKind::Unpair => "UNPAIR",
             NodeKind::Quote => "QUOTE",
             NodeKind::Apply => "APPLY",
+            NodeKind::If => "IF",
+            NodeKind::Token => "TOKEN",
+            NodeKind::Guard => "GUARD",
+            NodeKind::Deopt => "DEOPT",
         },
     );
 
@@ -192,6 +211,14 @@ fn encode_inputs_preserve(buf: &mut Vec<u8>, inputs: &[NodeInput]) {
     }
 }
 
+fn encode_single_input(buf: &mut Vec<u8>, input: &NodeInput) {
+    push_map(buf, 2);
+    push_text(buf, "cid");
+    push_bytes(buf, &input.cid);
+    push_text(buf, "port");
+    push_u32(buf, input.port);
+}
+
 fn encode_effects(buf: &mut Vec<u8>, effects: &[[u8; 32]]) {
     let mut sorted = effects.to_vec();
     sorted.sort();
@@ -219,6 +246,39 @@ fn encode_payload(buf: &mut Vec<u8>, payload: &NodePayload) {
                 push_text(buf, "type_key");
                 push_bytes(buf, key);
             }
+            return;
+        }
+        NodePayload::If {
+            true_cont,
+            false_cont,
+        } => {
+            push_map(buf, 2);
+            push_text(buf, "true");
+            encode_single_input(buf, true_cont);
+            push_text(buf, "false");
+            encode_single_input(buf, false_cont);
+            return;
+        }
+        NodePayload::Token => {
+            push_map(buf, 0);
+            return;
+        }
+        NodePayload::Guard {
+            type_key,
+            match_cont,
+            else_cont,
+        } => {
+            push_map(buf, 3);
+            push_text(buf, "guard_type");
+            push_bytes(buf, type_key);
+            push_text(buf, "match");
+            encode_single_input(buf, match_cont);
+            push_text(buf, "else");
+            encode_single_input(buf, else_cont);
+            return;
+        }
+        NodePayload::Deopt => {
+            push_map(buf, 0);
             return;
         }
         NodePayload::Empty => {
@@ -254,6 +314,10 @@ fn encode_payload(buf: &mut Vec<u8>, payload: &NodePayload) {
             push_bytes(buf, cid);
         }
         NodePayload::Apply { .. } => unreachable!(),
+        NodePayload::If { .. } => unreachable!(),
+        NodePayload::Token => unreachable!(),
+        NodePayload::Guard { .. } => unreachable!(),
+        NodePayload::Deopt => unreachable!(),
         NodePayload::Empty => unreachable!(),
     }
 }
@@ -330,12 +394,29 @@ fn validate_node(node: &NodeCanon) -> Result<()> {
             NodePayload::Apply { .. } => Ok(()),
             _ => bail!("APPLY node requires an apply payload"),
         },
+        NodeKind::If => match node.payload {
+            NodePayload::If { .. } => Ok(()),
+            _ => bail!("IF node requires branch payload"),
+        },
+        NodeKind::Token => match node.payload {
+            NodePayload::Token => Ok(()),
+            _ => bail!("TOKEN node must not carry payload"),
+        },
+        NodeKind::Guard => match node.payload {
+            NodePayload::Guard { .. } => Ok(()),
+            _ => bail!("GUARD node requires guard payload"),
+        },
+        NodeKind::Deopt => match node.payload {
+            NodePayload::Deopt => Ok(()),
+            _ => bail!("DEOPT node must not carry payload"),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TypeTag;
     use serde_cbor::Value;
 
     #[test]
@@ -489,5 +570,190 @@ mod tests {
             })
             .expect("quote bytes present");
         assert_eq!(quote_bytes.len(), 32);
+    }
+
+    #[test]
+    fn encode_if_node() {
+        let node = NodeCanon {
+            kind: NodeKind::If,
+            ty: None,
+            out: vec!["i64".to_string()],
+            inputs: vec![NodeInput {
+                cid: [0xAA; 32],
+                port: 0,
+            }],
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::If {
+                true_cont: NodeInput {
+                    cid: [0xBB; 32],
+                    port: 1,
+                },
+                false_cont: NodeInput {
+                    cid: [0xCC; 32],
+                    port: 0,
+                },
+            },
+        };
+        let encoded = encode(&node).unwrap();
+        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
+        let map = match value {
+            Value::Map(entries) => entries,
+            _ => panic!("IF node should encode as map"),
+        };
+        let mut fields = std::collections::BTreeMap::new();
+        for (k, v) in map {
+            if let Value::Text(key) = k {
+                fields.insert(key, v);
+            }
+        }
+        assert_eq!(fields.get("nk"), Some(&Value::Text("IF".to_string())));
+        let inputs = match fields.get("in").expect("inputs present") {
+            Value::Array(values) => values,
+            _ => panic!("inputs should be array"),
+        };
+        assert_eq!(inputs.len(), 1);
+        let payload = fields.get("pl").expect("payload present");
+        let payload_map = match payload {
+            Value::Map(entries) => entries,
+            _ => panic!("payload must be map"),
+        };
+        assert!(
+            payload_map
+                .iter()
+                .any(|(k, _)| matches!(k, Value::Text(s) if s == "true"))
+        );
+        assert!(
+            payload_map
+                .iter()
+                .any(|(k, _)| matches!(k, Value::Text(s) if s == "false"))
+        );
+    }
+
+    #[test]
+    fn encode_token_node() {
+        let node = NodeCanon {
+            kind: NodeKind::Token,
+            ty: Some(TypeTag::Ptr.as_atom().to_string()),
+            out: vec![TypeTag::Ptr.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Token,
+        };
+        let encoded = encode(&node).unwrap();
+        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
+        let map = match value {
+            Value::Map(entries) => entries,
+            _ => panic!("TOKEN node should encode as map"),
+        };
+        let mut fields = std::collections::BTreeMap::new();
+        for (k, v) in map {
+            if let Value::Text(key) = k {
+                fields.insert(key, v);
+            }
+        }
+        assert_eq!(fields.get("nk"), Some(&Value::Text("TOKEN".to_string())));
+        assert_eq!(
+            fields.get("out"),
+            Some(&Value::Array(vec![Value::Text("ptr".to_string())]))
+        );
+    }
+
+    #[test]
+    fn encode_guard_node() {
+        let key = guard_key(TypeTag::I64);
+        let node = NodeCanon {
+            kind: NodeKind::Guard,
+            ty: None,
+            out: vec!["i64".to_string()],
+            inputs: vec![NodeInput {
+                cid: [0xAA; 32],
+                port: 0,
+            }],
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Guard {
+                type_key: key,
+                match_cont: NodeInput {
+                    cid: [0xBB; 32],
+                    port: 0,
+                },
+                else_cont: NodeInput {
+                    cid: [0xCC; 32],
+                    port: 0,
+                },
+            },
+        };
+        let encoded = encode(&node).unwrap();
+        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
+        let map = match value {
+            Value::Map(entries) => entries,
+            _ => panic!("GUARD node should encode as map"),
+        };
+        let mut fields = std::collections::BTreeMap::new();
+        for (k, v) in map {
+            if let Value::Text(key) = k {
+                fields.insert(key, v);
+            }
+        }
+        assert_eq!(fields.get("nk"), Some(&Value::Text("GUARD".to_string())));
+        let payload = fields.get("pl").expect("payload present");
+        let payload_map = match payload {
+            Value::Map(entries) => entries,
+            _ => panic!("payload must be map"),
+        };
+        assert!(
+            payload_map
+                .iter()
+                .any(|(k, _)| matches!(k, Value::Text(s) if s == "guard_type"))
+        );
+        assert!(
+            payload_map
+                .iter()
+                .any(|(k, _)| matches!(k, Value::Text(s) if s == "match"))
+        );
+        assert!(
+            payload_map
+                .iter()
+                .any(|(k, _)| matches!(k, Value::Text(s) if s == "else"))
+        );
+    }
+
+    #[test]
+    fn encode_deopt_node() {
+        let node = NodeCanon {
+            kind: NodeKind::Deopt,
+            ty: None,
+            out: vec!["unit".to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Deopt,
+        };
+        let encoded = encode(&node).unwrap();
+        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
+        let map = match value {
+            Value::Map(entries) => entries,
+            _ => panic!("DEOPT node should encode as map"),
+        };
+        let mut fields = std::collections::BTreeMap::new();
+        for (k, v) in map {
+            if let Value::Text(key) = k {
+                fields.insert(key, v);
+            }
+        }
+        assert_eq!(fields.get("nk"), Some(&Value::Text("DEOPT".to_string())));
+    }
+
+    fn guard_key(tag: TypeTag) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        let atom = tag.as_atom().as_bytes();
+        bytes[..atom.len()].copy_from_slice(atom);
+        bytes
     }
 }

@@ -13,6 +13,7 @@ pub enum TypeTag {
     F64,
     Ptr,
     Unit,
+    Token,
 }
 
 impl TypeTag {
@@ -23,6 +24,7 @@ impl TypeTag {
             TypeTag::F64 => "f64",
             TypeTag::Ptr => "ptr",
             TypeTag::Unit => "unit",
+            TypeTag::Token => "token",
         }
     }
 
@@ -33,6 +35,7 @@ impl TypeTag {
             "f64" => Ok(TypeTag::F64),
             "ptr" => Ok(TypeTag::Ptr),
             "unit" => Ok(TypeTag::Unit),
+            "token" => Ok(TypeTag::Token),
             other => bail!("unknown type atom `{other}`"),
         }
     }

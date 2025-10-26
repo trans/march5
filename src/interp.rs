@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::str;
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
@@ -14,8 +15,33 @@ use crate::{TypeTag, cid, list_names_for_cid, load_object_cbor};
 /// Evaluates a word and returns its single `i64` result.
 /// Currently supports words whose parameters and results are all `i64`.
 pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32], args: &[i64]) -> Result<i64> {
+    let info = load_word_info(conn, word_cid)?;
+    if info.params.len() != args.len() {
+        bail!(
+            "argument mismatch: word expects {} params, got {}",
+            info.params.len(),
+            args.len()
+        );
+    }
+    for (idx, expected) in info.params.iter().enumerate() {
+        if *expected != TypeTag::I64 {
+            bail!(
+                "runner only supports i64 parameters (param {} has type {:?})",
+                idx,
+                expected
+            );
+        }
+    }
     let arg_values: Vec<Value> = args.iter().copied().map(Value::I64).collect();
-    let mut results = run_word(conn, word_cid, &arg_values)?;
+    let mut results = run_word_with_info(conn, &info, &arg_values)?;
+    if !info.effects.is_empty() {
+        match results.first() {
+            Some(Value::Token) => {
+                results.remove(0);
+            }
+            _ => bail!("effectful word missing token output"),
+        }
+    }
     let value = results
         .pop()
         .ok_or_else(|| anyhow!("runner expected a single result"))?;
@@ -28,6 +54,14 @@ pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32], args: &[i64]) -> Res
 /// Evaluate a word and return its result values.
 pub fn run_word(conn: &Connection, word_cid: &[u8; 32], args: &[Value]) -> Result<Vec<Value>> {
     let info = load_word_info(conn, word_cid)?;
+    run_word_with_info(conn, &info, args)
+}
+
+fn run_word_with_info(
+    conn: &Connection,
+    info: &crate::word::WordInfo,
+    args: &[Value],
+) -> Result<Vec<Value>> {
     if info.params.len() != args.len() {
         bail!(
             "argument mismatch: word expects {} params, got {}",
@@ -47,14 +81,27 @@ pub fn run_word(conn: &Connection, word_cid: &[u8; 32], args: &[Value]) -> Resul
     }
     let mut cache: HashMap<[u8; 32], Vec<Value>> = HashMap::new();
     let outputs = eval_return(conn, &info.root, &mut cache, args, &info.results)?;
-    if outputs.len() != info.results.len() {
+    let has_token = !info.effects.is_empty();
+    if has_token {
+        match outputs.first() {
+            Some(Value::Token) => {}
+            _ => bail!("effectful word missing token output"),
+        }
+    }
+    let expected_len = info.results.len() + if has_token { 1 } else { 0 };
+    if outputs.len() != expected_len {
         bail!(
             "result count mismatch: word declares {}, runner produced {}",
             info.results.len(),
             outputs.len()
         );
     }
-    for (idx, (expected, actual)) in info.results.iter().zip(outputs.iter()).enumerate() {
+    for (idx, (expected, actual)) in info
+        .results
+        .iter()
+        .zip(outputs.iter().skip(if has_token { 1 } else { 0 }))
+        .enumerate()
+    {
         if actual.type_tag() != *expected {
             bail!(
                 "result {} type mismatch: expected {:?}, got {:?}",
@@ -117,6 +164,16 @@ struct NodePayloadRecord {
     apply_qid: Option<ByteBuf>,
     #[serde(default, rename = "type_key")]
     apply_type_key: Option<ByteBuf>,
+    #[serde(default, rename = "true")]
+    if_true: Option<NodeInputRecord>,
+    #[serde(default, rename = "false")]
+    if_false: Option<NodeInputRecord>,
+    #[serde(default, rename = "guard_type")]
+    guard_type: Option<ByteBuf>,
+    #[serde(default, rename = "match")]
+    guard_match: Option<NodeInputRecord>,
+    #[serde(default, rename = "else")]
+    guard_else: Option<NodeInputRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -127,6 +184,7 @@ pub enum Value {
     Unit,
     Tuple(Vec<Value>),
     Quote([u8; 32]),
+    Token,
 }
 
 impl Value {
@@ -138,6 +196,7 @@ impl Value {
             Value::Unit => TypeTag::Unit,
             Value::Tuple(_) => TypeTag::Ptr,
             Value::Quote(_) => TypeTag::Ptr,
+            Value::Token => TypeTag::Token,
         }
     }
 }
@@ -158,6 +217,7 @@ impl fmt::Display for Value {
                 write!(f, "({body})")
             }
             Value::Quote(qid) => write!(f, "<quote:{}>", cid::to_hex(qid)),
+            Value::Token => write!(f, "<token>"),
         }
     }
 }
@@ -199,24 +259,55 @@ fn eval_node(
             vec![value]
         }
         "PRIM" => {
-            let inputs = eval_inputs(conn, &record.inputs, cache, args)?;
+            let mut inputs = eval_inputs(conn, &record.inputs, cache, args)?;
             let prim_cid_buf = record
                 .payload
                 .prim
                 .ok_or_else(|| anyhow!("PRIM node missing primitive payload"))?;
             let prim_cid = bytebuf_to_array(&prim_cid_buf)?;
-            vec![eval_primitive(conn, &prim_cid, inputs)?]
+            let has_token_out = record
+                .out
+                .as_ref()
+                .and_then(|outs| outs.first())
+                .map(|s| s == "token")
+                .unwrap_or(false);
+            if has_token_out {
+                match inputs.pop() {
+                    Some(Value::Token) => {}
+                    _ => bail!("PRIM node missing token input"),
+                }
+            }
+            let mut outputs = Vec::new();
+            if has_token_out {
+                outputs.push(Value::Token);
+            }
+            outputs.push(eval_primitive(conn, &prim_cid, inputs)?);
+            outputs
         }
         "CALL" => {
-            let inputs = eval_inputs(conn, &record.inputs, cache, args)?;
+            let mut inputs = eval_inputs(conn, &record.inputs, cache, args)?;
             let word_buf = record
                 .payload
                 .word
                 .ok_or_else(|| anyhow!("CALL node missing word payload"))?;
             let word_cid = bytebuf_to_array(&word_buf)?;
-            // TODO: support stack-passed quotations by dispatching without assuming
-            // eagerly inlined bodies.
-            run_word(conn, &word_cid, &inputs)?
+            let has_token_out = record
+                .out
+                .as_ref()
+                .and_then(|outs| outs.first())
+                .map(|s| s == "token")
+                .unwrap_or(false);
+            if has_token_out {
+                match inputs.pop() {
+                    Some(Value::Token) => {}
+                    _ => bail!("CALL node missing token input"),
+                }
+            }
+            let mut outputs = run_word(conn, &word_cid, &inputs)?;
+            if has_token_out {
+                outputs.insert(0, Value::Token);
+            }
+            outputs
         }
         "PAIR" => {
             let inputs = eval_inputs(conn, &record.inputs, cache, args)?;
@@ -250,13 +341,90 @@ fn eval_node(
             vec![Value::Quote(qid)]
         }
         "APPLY" => {
+            let mut inputs = eval_inputs(conn, &record.inputs, cache, args)?;
             let qid_buf = record
                 .payload
                 .apply_qid
                 .ok_or_else(|| anyhow!("APPLY node missing qid payload"))?;
             let qid = bytebuf_to_array(&qid_buf)?;
-            let inputs = eval_inputs(conn, &record.inputs, cache, args)?;
-            run_word(conn, &qid, &inputs)?
+            let has_token_out = record
+                .out
+                .as_ref()
+                .and_then(|outs| outs.first())
+                .map(|s| s == "token")
+                .unwrap_or(false);
+            if has_token_out {
+                match inputs.pop() {
+                    Some(Value::Token) => {}
+                    _ => bail!("APPLY node missing token input"),
+                }
+            }
+            let mut outputs = run_word(conn, &qid, &inputs)?;
+            if has_token_out {
+                outputs.insert(0, Value::Token);
+            }
+            outputs
+        }
+        "TOKEN" => vec![Value::Token],
+        "GUARD" => {
+            if record.inputs.len() != 1 {
+                bail!(
+                    "GUARD node requires exactly one input, found {}",
+                    record.inputs.len()
+                );
+            }
+            let guard_type_bytes = record
+                .payload
+                .guard_type
+                .as_ref()
+                .ok_or_else(|| anyhow!("GUARD node missing type key payload"))?;
+            let expected_tag = decode_guard_type_key(guard_type_bytes.as_ref())?;
+
+            let input_value = eval_input(conn, &record.inputs[0], cache, args)?;
+            let matches = input_value.type_tag() == expected_tag;
+            let branch = if matches {
+                record
+                    .payload
+                    .guard_match
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("GUARD missing match continuation"))?
+            } else {
+                record
+                    .payload
+                    .guard_else
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("GUARD missing else continuation"))?
+            };
+            vec![eval_input(conn, branch, cache, args)?]
+        }
+        "DEOPT" => bail!("deopt triggered"),
+        "IF" => {
+            if record.inputs.len() != 1 {
+                bail!(
+                    "IF node requires exactly one condition input, found {}",
+                    record.inputs.len()
+                );
+            }
+            let cond_value = eval_input(conn, &record.inputs[0], cache, args)?;
+            let cond_truth = match cond_value {
+                Value::I64(n) => n != 0,
+                _ => bail!("IF condition must be i64 (0/!=0)"),
+            };
+            let branch = if cond_truth {
+                record
+                    .payload
+                    .if_true
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("IF missing true continuation"))?
+            } else {
+                record
+                    .payload
+                    .if_false
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("IF missing false continuation"))?
+            };
+            let result = eval_input(conn, branch, cache, args)?;
+            vec![result]
         }
         "RETURN" => bail!("RETURN node should be handled at word entry"),
         "LOAD_GLOBAL" => bail!("LOAD_GLOBAL not supported by runner (yet)"),
@@ -357,6 +525,13 @@ fn value_to_ptr(value: &Value) -> Result<u64> {
     }
 }
 
+fn decode_guard_type_key(bytes: &[u8]) -> Result<TypeTag> {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    let slice = &bytes[..end];
+    let atom = str::from_utf8(slice)?;
+    TypeTag::from_atom(atom)
+}
+
 fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) -> Result<Value> {
     let info = load_prim_info(conn, prim_cid)?;
     let name = list_names_for_cid(conn, "prim", prim_cid)?
@@ -400,8 +575,16 @@ fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) ->
 mod tests {
     use super::*;
     use crate::builder::GraphBuilder;
+    use crate::node::{NodeCanon, NodeInput, NodeKind, NodePayload};
     use crate::store;
     use crate::types::TypeTag;
+
+    fn guard_key(tag: TypeTag) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        let atom = tag.as_atom().as_bytes();
+        bytes[..atom.len()].copy_from_slice(atom);
+        bytes
+    }
 
     #[test]
     fn run_word_supports_multi_result_literals() -> Result<()> {
@@ -433,6 +616,381 @@ mod tests {
 
         let outputs = run_word(&conn, &word_cid, &[])?;
         assert!(outputs.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn run_word_guard_match_branch() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let value_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(5),
+        };
+        let value_cid = crate::node::store_node(&conn, &value_node)?.cid;
+
+        let match_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(1),
+        };
+        let match_cid = crate::node::store_node(&conn, &match_node)?.cid;
+
+        let else_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(99),
+        };
+        let else_cid = crate::node::store_node(&conn, &else_node)?.cid;
+
+        let guard_node = NodeCanon {
+            kind: NodeKind::Guard,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: vec![NodeInput {
+                cid: value_cid,
+                port: 0,
+            }],
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Guard {
+                type_key: guard_key(TypeTag::I64),
+                match_cont: NodeInput {
+                    cid: match_cid,
+                    port: 0,
+                },
+                else_cont: NodeInput {
+                    cid: else_cid,
+                    port: 0,
+                },
+            },
+        };
+        let guard_cid = crate::node::store_node(&conn, &guard_node)?.cid;
+
+        let return_node = NodeCanon {
+            kind: NodeKind::Return,
+            ty: None,
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: vec![NodeInput {
+                cid: guard_cid,
+                port: 0,
+            }],
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Return,
+        };
+        let return_cid = crate::node::store_node(&conn, &return_node)?.cid;
+
+        let word = crate::word::WordCanon {
+            root: return_cid,
+            params: Vec::new(),
+            results: vec![TypeTag::I64.as_atom().to_string()],
+            effects: Vec::new(),
+        };
+        let word_cid = crate::word::store_word(&conn, &word)?.cid;
+
+        let outputs = run_word(&conn, &word_cid, &[])?;
+        assert_eq!(outputs, vec![Value::I64(1)]);
+        Ok(())
+    }
+
+    #[test]
+    fn run_word_guard_else_branch() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let value_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(5),
+        };
+        let value_cid = crate::node::store_node(&conn, &value_node)?.cid;
+
+        let match_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(1),
+        };
+        let match_cid = crate::node::store_node(&conn, &match_node)?.cid;
+
+        let else_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(99),
+        };
+        let else_cid = crate::node::store_node(&conn, &else_node)?.cid;
+
+        let guard_node = NodeCanon {
+            kind: NodeKind::Guard,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: vec![NodeInput {
+                cid: value_cid,
+                port: 0,
+            }],
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Guard {
+                type_key: guard_key(TypeTag::F64),
+                match_cont: NodeInput {
+                    cid: match_cid,
+                    port: 0,
+                },
+                else_cont: NodeInput {
+                    cid: else_cid,
+                    port: 0,
+                },
+            },
+        };
+        let guard_cid = crate::node::store_node(&conn, &guard_node)?.cid;
+
+        let return_node = NodeCanon {
+            kind: NodeKind::Return,
+            ty: None,
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: vec![NodeInput {
+                cid: guard_cid,
+                port: 0,
+            }],
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Return,
+        };
+        let return_cid = crate::node::store_node(&conn, &return_node)?.cid;
+
+        let word = crate::word::WordCanon {
+            root: return_cid,
+            params: Vec::new(),
+            results: vec![TypeTag::I64.as_atom().to_string()],
+            effects: Vec::new(),
+        };
+        let word_cid = crate::word::store_word(&conn, &word)?.cid;
+
+        let outputs = run_word(&conn, &word_cid, &[])?;
+        assert_eq!(outputs, vec![Value::I64(99)]);
+        Ok(())
+    }
+
+    #[test]
+    fn run_word_guard_else_deopt() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let value_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(5),
+        };
+        let value_cid = crate::node::store_node(&conn, &value_node)?.cid;
+
+        let match_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(1),
+        };
+        let match_cid = crate::node::store_node(&conn, &match_node)?.cid;
+
+        let deopt_node = NodeCanon {
+            kind: NodeKind::Deopt,
+            ty: None,
+            out: vec![TypeTag::Unit.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Deopt,
+        };
+        let deopt_cid = crate::node::store_node(&conn, &deopt_node)?.cid;
+
+        let guard_node = NodeCanon {
+            kind: NodeKind::Guard,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: vec![NodeInput {
+                cid: value_cid,
+                port: 0,
+            }],
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Guard {
+                type_key: guard_key(TypeTag::F64),
+                match_cont: NodeInput {
+                    cid: match_cid,
+                    port: 0,
+                },
+                else_cont: NodeInput {
+                    cid: deopt_cid,
+                    port: 0,
+                },
+            },
+        };
+        let guard_cid = crate::node::store_node(&conn, &guard_node)?.cid;
+
+        let return_node = NodeCanon {
+            kind: NodeKind::Return,
+            ty: None,
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: vec![NodeInput {
+                cid: guard_cid,
+                port: 0,
+            }],
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Return,
+        };
+        let return_cid = crate::node::store_node(&conn, &return_node)?.cid;
+
+        let word = crate::word::WordCanon {
+            root: return_cid,
+            params: Vec::new(),
+            results: vec![TypeTag::I64.as_atom().to_string()],
+            effects: Vec::new(),
+        };
+        let word_cid = crate::word::store_word(&conn, &word)?.cid;
+
+        let err = run_word(&conn, &word_cid, &[]).unwrap_err();
+        assert!(err.to_string().contains("deopt"));
+        Ok(())
+    }
+
+    #[test]
+    fn run_word_handles_if_true_branch() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let cond_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(1),
+        };
+        let cond_cid = crate::node::store_node(&conn, &cond_node)?.cid;
+
+        let true_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(42),
+        };
+        let true_cid = crate::node::store_node(&conn, &true_node)?.cid;
+
+        let false_node = NodeCanon {
+            kind: NodeKind::Lit,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::LitI64(7),
+        };
+        let false_cid = crate::node::store_node(&conn, &false_node)?.cid;
+
+        let if_node = NodeCanon {
+            kind: NodeKind::If,
+            ty: Some(TypeTag::I64.as_atom().to_string()),
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: vec![NodeInput {
+                cid: cond_cid,
+                port: 0,
+            }],
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::If {
+                true_cont: NodeInput {
+                    cid: true_cid,
+                    port: 0,
+                },
+                false_cont: NodeInput {
+                    cid: false_cid,
+                    port: 0,
+                },
+            },
+        };
+        let if_cid = crate::node::store_node(&conn, &if_node)?.cid;
+
+        let return_node = NodeCanon {
+            kind: NodeKind::Return,
+            ty: None,
+            out: vec![TypeTag::I64.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: vec![NodeInput {
+                cid: if_cid,
+                port: 0,
+            }],
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Return,
+        };
+        let return_cid = crate::node::store_node(&conn, &return_node)?.cid;
+
+        let word = crate::word::WordCanon {
+            root: return_cid,
+            params: Vec::new(),
+            results: vec![TypeTag::I64.as_atom().to_string()],
+            effects: Vec::new(),
+        };
+        let word_cid = crate::word::store_word(&conn, &word)?.cid;
+
+        let outputs = run_word(&conn, &word_cid, &[])?;
+        assert_eq!(outputs, vec![Value::I64(42)]);
         Ok(())
     }
 }

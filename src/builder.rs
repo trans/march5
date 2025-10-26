@@ -34,7 +34,8 @@ pub struct GraphBuilder<'conn> {
     prim_cache: HashMap<[u8; 32], PrimInfo>,
     word_cache: HashMap<[u8; 32], WordInfo>,
     accumulated_effects: Vec<[u8; 32]>,
-    effect_frontier: BTreeMap<[u8; 32], StackItem>,
+    effect_frontier: BTreeMap<[u8; 32], NodeInput>,
+    token_input: Option<NodeInput>,
 }
 
 impl<'conn> GraphBuilder<'conn> {
@@ -48,7 +49,57 @@ impl<'conn> GraphBuilder<'conn> {
             word_cache: HashMap::new(),
             accumulated_effects: Vec::new(),
             effect_frontier: BTreeMap::new(),
+            token_input: None,
         }
+    }
+
+    #[allow(dead_code)]
+    /// Close the current branch with an IF node pairing two continuations.
+    pub fn branch_if(
+        &mut self,
+        condition_ty: TypeTag,
+        true_label: [u8; 32],
+        false_label: [u8; 32],
+    ) -> Result<[u8; 32]> {
+        let cond = self
+            .stack
+            .pop()
+            .ok_or_else(|| anyhow!("stack underflow: if"))?;
+        if cond.ty != condition_ty {
+            bail!(
+                "if condition type mismatch: expected {:?}, got {:?}",
+                condition_ty,
+                cond.ty
+            );
+        }
+
+        let true_input = NodeInput {
+            cid: true_label,
+            port: 0,
+        };
+        let false_input = NodeInput {
+            cid: false_label,
+            port: 0,
+        };
+
+        let node = NodeCanon {
+            kind: NodeKind::If,
+            ty: None,
+            out: Vec::new(),
+            inputs: vec![NodeInput {
+                cid: cond.cid,
+                port: cond.port,
+            }],
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::If {
+                true_cont: true_input,
+                false_cont: false_input,
+            },
+        };
+        let outcome = node::store_node(self.conn, &node)?;
+        Ok(outcome.cid)
     }
 
     /// Start assembling a word with the given parameter types, seeding ARG nodes.
@@ -57,6 +108,7 @@ impl<'conn> GraphBuilder<'conn> {
         self.param_types = params.to_vec();
         self.accumulated_effects.clear();
         self.effect_frontier.clear();
+        self.token_input = None;
 
         for (idx, ty) in params.iter().enumerate() {
             let node = NodeCanon {
@@ -306,7 +358,7 @@ impl<'conn> GraphBuilder<'conn> {
             }
         }
 
-        let inputs: SmallVec<[NodeInput; 8]> = popped
+        let mut inputs_vec: Vec<NodeInput> = popped
             .iter()
             .map(|item| NodeInput {
                 cid: item.cid,
@@ -314,16 +366,32 @@ impl<'conn> GraphBuilder<'conn> {
             })
             .collect();
 
+        let emits_token = !effects.is_empty()
+            && matches!(
+                payload,
+                NodePayload::Prim(_) | NodePayload::Word(_) | NodePayload::Apply { .. }
+            );
+        if emits_token {
+            let token_in = self.ensure_token()?;
+            inputs_vec.push(token_in);
+        }
+
         let kind = match &payload {
             NodePayload::Prim(..) => NodeKind::Prim,
             NodePayload::Word(..) => NodeKind::Call,
             NodePayload::Apply { .. } => NodeKind::Apply,
+            NodePayload::Quote(..) => NodeKind::Quote,
+            NodePayload::If { .. } => NodeKind::If,
+            NodePayload::Token => NodeKind::Token,
             _ => unreachable!("apply_general: unsupported payload"),
         };
 
-        let out_atoms: Vec<String> = results.iter().map(|t| t.as_atom().to_string()).collect();
-        let ty_field = if results.len() == 1 {
-            Some(results[0].as_atom().to_string())
+        let mut out_atoms: Vec<String> = results.iter().map(|t| t.as_atom().to_string()).collect();
+        if emits_token {
+            out_atoms.insert(0, TypeTag::Token.as_atom().to_string());
+        }
+        let ty_field = if out_atoms.len() == 1 {
+            Some(out_atoms[0].clone())
         } else {
             None
         };
@@ -332,7 +400,7 @@ impl<'conn> GraphBuilder<'conn> {
             kind,
             ty: ty_field,
             out: out_atoms,
-            inputs: inputs.into_vec(),
+            inputs: inputs_vec,
             vals: Vec::new(),
             deps: Vec::new(),
             effects: effects.to_vec(),
@@ -341,23 +409,28 @@ impl<'conn> GraphBuilder<'conn> {
 
         let outcome = node::store_node(self.conn, &node)?;
         self.accumulated_effects.extend(effects.iter().copied());
-        for (port, ty) in results.iter().copied().enumerate() {
+
+        let mut data_port_offset = 0u32;
+        if emits_token {
+            let token_out = NodeInput {
+                cid: outcome.cid,
+                port: 0,
+            };
+            self.token_input = Some(token_out);
+            for effect in effects {
+                self.effect_frontier.insert(*effect, token_out);
+            }
+            data_port_offset = 1;
+        }
+
+        for (idx, ty) in results.iter().copied().enumerate() {
             self.stack.push(StackItem {
                 cid: outcome.cid,
-                port: port as u32,
+                port: idx as u32 + data_port_offset,
                 ty,
             });
         }
-        for effect in effects {
-            self.effect_frontier.insert(
-                *effect,
-                StackItem {
-                    cid: outcome.cid,
-                    port: 0,
-                    ty: TypeTag::Unit,
-                },
-            );
-        }
+
         Ok(outcome.cid)
     }
 
@@ -434,7 +507,9 @@ impl<'conn> GraphBuilder<'conn> {
             );
         }
 
-        let mut vals = Vec::with_capacity(results.len());
+        let has_effects = !self.accumulated_effects.is_empty();
+
+        let mut vals = Vec::with_capacity(results.len() + if has_effects { 1 } else { 0 });
         for (idx, expected) in results.iter().enumerate() {
             let item = self
                 .stack
@@ -455,14 +530,14 @@ impl<'conn> GraphBuilder<'conn> {
         }
         vals.reverse();
 
-        let mut deps: Vec<NodeInput> = self
-            .effect_frontier
-            .values()
-            .map(|item| NodeInput {
-                cid: item.cid,
-                port: item.port,
-            })
-            .collect();
+        if has_effects {
+            let token = self
+                .token_input
+                .ok_or_else(|| anyhow!("effectful word missing token output"))?;
+            vals.insert(0, token);
+        }
+
+        let mut deps: Vec<NodeInput> = self.effect_frontier.values().copied().collect();
         deps.sort_by(|a, b| match a.cid.cmp(&b.cid) {
             std::cmp::Ordering::Equal => a.port.cmp(&b.port),
             other => other,
@@ -472,12 +547,16 @@ impl<'conn> GraphBuilder<'conn> {
         self.accumulated_effects.sort_unstable();
         self.accumulated_effects.dedup();
 
-        let out_types: Vec<String> = results.iter().map(|t| t.as_atom().to_string()).collect();
+        let mut return_out_types = Vec::new();
+        if has_effects {
+            return_out_types.push(TypeTag::Token.as_atom().to_string());
+        }
+        return_out_types.extend(results.iter().map(|t| t.as_atom().to_string()));
 
         let return_node = NodeCanon {
             kind: NodeKind::Return,
             ty: None,
-            out: out_types.clone(),
+            out: return_out_types,
             inputs: Vec::new(),
             vals,
             deps,
@@ -489,7 +568,7 @@ impl<'conn> GraphBuilder<'conn> {
         let word = WordCanon {
             root: return_outcome.cid,
             params: params.iter().map(|t| t.as_atom().to_string()).collect(),
-            results: out_types,
+            results: results.iter().map(|t| t.as_atom().to_string()).collect(),
             effects: self.accumulated_effects.clone(),
         };
         let outcome = word::store_word(self.conn, &word)?;
@@ -501,7 +580,32 @@ impl<'conn> GraphBuilder<'conn> {
         self.param_types.clear();
         self.accumulated_effects.clear();
         self.effect_frontier.clear();
+        self.token_input = None;
         Ok(outcome.cid)
+    }
+
+    fn ensure_token(&mut self) -> Result<NodeInput> {
+        if let Some(token) = self.token_input {
+            return Ok(token);
+        }
+
+        let node = NodeCanon {
+            kind: NodeKind::Token,
+            ty: Some(TypeTag::Token.as_atom().to_string()),
+            out: vec![TypeTag::Token.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Token,
+        };
+        let outcome = node::store_node(self.conn, &node)?;
+        let token = NodeInput {
+            cid: outcome.cid,
+            port: 0,
+        };
+        self.token_input = Some(token);
+        Ok(token)
     }
 
     #[inline]
