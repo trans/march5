@@ -106,6 +106,103 @@ impl<'conn> GraphBuilder<'conn> {
         Ok(outcome.cid)
     }
 
+    /// Pair the top two stack values into a single tuple value.
+    pub fn pair(&mut self) -> Result<[u8; 32]> {
+        let right = self
+            .stack
+            .pop()
+            .ok_or_else(|| anyhow!("stack underflow: pair right"))?;
+        let left = self
+            .stack
+            .pop()
+            .ok_or_else(|| anyhow!("stack underflow: pair left"))?;
+
+        let node = NodeCanon {
+            kind: NodeKind::Pair,
+            ty: Some(TypeTag::Ptr.as_atom().to_string()),
+            out: vec![TypeTag::Ptr.as_atom().to_string()],
+            inputs: vec![
+                NodeInput {
+                    cid: left.cid,
+                    port: left.port,
+                },
+                NodeInput {
+                    cid: right.cid,
+                    port: right.port,
+                },
+            ],
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Empty,
+        };
+        let outcome = node::store_node(self.conn, &node)?;
+        self.stack.push(StackItem {
+            cid: outcome.cid,
+            port: 0,
+            ty: TypeTag::Ptr,
+        });
+        Ok(outcome.cid)
+    }
+
+    /// Unpair the top stack value, yielding two outputs in order.
+    pub fn unpair(&mut self, left_ty: TypeTag, right_ty: TypeTag) -> Result<[u8; 32]> {
+        let pair = self
+            .stack
+            .pop()
+            .ok_or_else(|| anyhow!("stack underflow: unpair"))?;
+
+        let node = NodeCanon {
+            kind: NodeKind::Unpair,
+            ty: None,
+            out: vec![
+                left_ty.as_atom().to_string(),
+                right_ty.as_atom().to_string(),
+            ],
+            inputs: vec![NodeInput {
+                cid: pair.cid,
+                port: pair.port,
+            }],
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Empty,
+        };
+        let outcome = node::store_node(self.conn, &node)?;
+        self.stack.push(StackItem {
+            cid: outcome.cid,
+            port: 0,
+            ty: left_ty,
+        });
+        self.stack.push(StackItem {
+            cid: outcome.cid,
+            port: 1,
+            ty: right_ty,
+        });
+        Ok(outcome.cid)
+    }
+
+    /// Push a quotation literal on the stack.
+    pub fn quote(&mut self, qid: [u8; 32]) -> Result<[u8; 32]> {
+        let node = NodeCanon {
+            kind: NodeKind::Quote,
+            ty: Some(TypeTag::Ptr.as_atom().to_string()),
+            out: vec![TypeTag::Ptr.as_atom().to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Quote(qid),
+        };
+        let outcome = node::store_node(self.conn, &node)?;
+        self.stack.push(StackItem {
+            cid: outcome.cid,
+            port: 0,
+            ty: TypeTag::Ptr,
+        });
+        Ok(outcome.cid)
+    }
+
     /// Wire-only DUP: (x -- x x)
     pub fn dup(&mut self) -> Result<()> {
         let top = self
@@ -220,12 +317,13 @@ impl<'conn> GraphBuilder<'conn> {
         let kind = match &payload {
             NodePayload::Prim(..) => NodeKind::Prim,
             NodePayload::Word(..) => NodeKind::Call,
-            _ => unreachable!("apply_general: Prim/Word only"),
+            NodePayload::Apply { .. } => NodeKind::Apply,
+            _ => unreachable!("apply_general: unsupported payload"),
         };
 
         let out_atoms: Vec<String> = results.iter().map(|t| t.as_atom().to_string()).collect();
-        let ty_field = if out_atoms.len() == 1 {
-            Some(out_atoms[0].clone())
+        let ty_field = if results.len() == 1 {
+            Some(results[0].as_atom().to_string())
         } else {
             None
         };
@@ -287,6 +385,24 @@ impl<'conn> GraphBuilder<'conn> {
         )
     }
 
+    /// Apply a specialized quotation (APPLY agent) with optional type key.
+    pub fn apply_quotation(
+        &mut self,
+        qid: [u8; 32],
+        params: &[TypeTag],
+        results: &[TypeTag],
+        effects: &[[u8; 32]],
+        type_key: Option<[u8; 32]>,
+    ) -> Result<[u8; 32]> {
+        self.apply_general(
+            params.len(),
+            params,
+            results,
+            effects,
+            NodePayload::Apply { qid, type_key },
+        )
+    }
+
     /// Expose the top CID without consuming it.
     pub fn peek_cid(&self) -> Result<[u8; 32]> {
         self.stack
@@ -337,6 +453,8 @@ impl<'conn> GraphBuilder<'conn> {
                 port: item.port,
             });
         }
+        vals.reverse();
+
         let mut deps: Vec<NodeInput> = self
             .effect_frontier
             .values()
@@ -428,6 +546,8 @@ mod tests {
     use super::*;
     use crate::prim::{self, PrimCanon};
     use crate::store;
+    use crate::{Value, run_word};
+    use serde_cbor::Value as CborValue;
 
     #[test]
     fn build_add_word() -> Result<()> {
@@ -545,8 +665,6 @@ mod tests {
 
     #[test]
     fn finish_void_word_creates_return() -> Result<()> {
-        use serde_cbor::Value;
-
         let conn = Connection::open_in_memory()?;
         store::install_schema(&conn)?;
 
@@ -559,11 +677,11 @@ mod tests {
         assert!(info.results.is_empty());
 
         let (_kind, cbor) = crate::load_object_cbor(&conn, &info.root)?;
-        let value: Value = serde_cbor::from_slice(&cbor)?;
+        let value: CborValue = serde_cbor::from_slice(&cbor)?;
         let mut map = std::collections::BTreeMap::new();
-        if let Value::Map(entries) = value {
+        if let CborValue::Map(entries) = value {
             for (k, v) in entries {
-                if let Value::Text(key) = k {
+                if let CborValue::Text(key) = k {
                     map.insert(key, v);
                 }
             }
@@ -571,10 +689,181 @@ mod tests {
             bail!("RETURN node did not encode as map");
         }
 
-        assert_eq!(map.get("nk"), Some(&Value::Text("RETURN".to_string())));
-        assert_eq!(map.get("out"), Some(&Value::Array(Vec::new())));
-        assert_eq!(map.get("vals"), Some(&Value::Array(Vec::new())));
+        assert_eq!(map.get("nk"), Some(&CborValue::Text("RETURN".to_string())));
+        assert_eq!(map.get("out"), Some(&CborValue::Array(Vec::new())));
+        assert_eq!(map.get("vals"), Some(&CborValue::Array(Vec::new())));
 
+        Ok(())
+    }
+
+    #[test]
+    fn finish_word_preserves_result_order() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[])?;
+
+        let first = builder.push_lit_i64(1)?;
+        let second = builder.push_lit_i64(2)?;
+
+        let word_cid =
+            builder.finish_word(&[], &[TypeTag::I64, TypeTag::I64], Some("demo/pair"))?;
+
+        let info = crate::word::load_word_info(&conn, &word_cid)?;
+        assert_eq!(info.results, vec![TypeTag::I64, TypeTag::I64]);
+
+        let (_kind, cbor) = crate::load_object_cbor(&conn, &info.root)?;
+        let value: CborValue = serde_cbor::from_slice(&cbor)?;
+        let vals = match value {
+            CborValue::Map(entries) => entries
+                .into_iter()
+                .find_map(|(k, v)| {
+                    if let CborValue::Text(key) = k {
+                        if key == "vals" {
+                            return Some(v);
+                        }
+                    }
+                    None
+                })
+                .expect("RETURN node vals present"),
+            _ => bail!("RETURN node did not encode as map"),
+        };
+        let vals = match vals {
+            CborValue::Array(entries) => entries,
+            _ => bail!("RETURN vals not array"),
+        };
+        assert_eq!(vals.len(), 2);
+        let mut cid_order = Vec::new();
+        for entry in &vals {
+            let map_entries = match entry {
+                CborValue::Map(entries) => entries,
+                _ => bail!("RETURN val entry not map"),
+            };
+            let cid_bytes = map_entries
+                .iter()
+                .find_map(|(k, v)| match (k, v) {
+                    (CborValue::Text(key), CborValue::Bytes(bytes)) if key == "cid" => {
+                        Some(bytes.clone())
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| anyhow::anyhow!("cid missing"))?;
+            let mut arr = [0u8; 32];
+            if cid_bytes.len() != 32 {
+                bail!("unexpected cid length");
+            }
+            arr.copy_from_slice(&cid_bytes);
+            cid_order.push(arr);
+        }
+        assert_eq!(cid_order[0], first);
+        assert_eq!(cid_order[1], second);
+        Ok(())
+    }
+
+    #[test]
+    fn finish_word_tracks_effect_dependencies() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let param_tags = [TypeTag::I64, TypeTag::I64];
+        let result_tags = [TypeTag::I64];
+        let effect = [0xEE; 32];
+        let prim = PrimCanon {
+            params: &param_tags,
+            results: &result_tags,
+            attrs: &[],
+            effects: &[effect],
+        };
+        let prim_outcome = prim::store_prim(&conn, &prim)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[])?;
+        builder.push_lit_i64(1)?;
+        builder.push_lit_i64(2)?;
+        let prim_node_cid = builder.apply_prim(prim_outcome.cid)?;
+
+        let word_cid = builder.finish_word(&[], &[TypeTag::I64], Some("demo/effect"))?;
+        let info = crate::word::load_word_info(&conn, &word_cid)?;
+        assert_eq!(info.effects, vec![effect]);
+
+        let (_kind, cbor) = crate::load_object_cbor(&conn, &info.root)?;
+        let value: CborValue = serde_cbor::from_slice(&cbor)?;
+        let deps = match value {
+            CborValue::Map(entries) => entries
+                .into_iter()
+                .find_map(|(k, v)| match k {
+                    CborValue::Text(key) if key == "deps" => Some(v),
+                    _ => None,
+                })
+                .expect("RETURN deps present"),
+            _ => bail!("RETURN node did not encode as map"),
+        };
+        let deps = match deps {
+            CborValue::Array(entries) => entries,
+            _ => bail!("deps not array"),
+        };
+        assert_eq!(deps.len(), 1);
+        let map_entries = match &deps[0] {
+            CborValue::Map(entries) => entries,
+            _ => bail!("dependency entry not map"),
+        };
+        let cid = map_entries
+            .iter()
+            .find_map(|(k, v)| match (k, v) {
+                (CborValue::Text(key), CborValue::Bytes(bytes)) if key == "cid" => {
+                    Some(bytes.clone())
+                }
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("dependency cid missing"))?;
+        let mut arr = [0u8; 32];
+        if cid.len() != 32 {
+            bail!("unexpected cid length");
+        }
+        arr.copy_from_slice(&cid);
+        assert_eq!(arr, prim_node_cid);
+        Ok(())
+    }
+
+    #[test]
+    fn pair_and_unpair_roundtrip() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[])?;
+        builder.push_lit_i64(10)?;
+        builder.push_lit_i64(20)?;
+        builder.pair()?;
+        builder.unpair(TypeTag::I64, TypeTag::I64)?;
+        let word_cid =
+            builder.finish_word(&[], &[TypeTag::I64, TypeTag::I64], Some("demo/pair"))?;
+
+        let outputs = run_word(&conn, &word_cid, &[])?;
+        assert_eq!(outputs, vec![Value::I64(10), Value::I64(20)]);
+        Ok(())
+    }
+
+    #[test]
+    fn apply_quotation_invokes_target() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        // target word
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[])?;
+        builder.push_lit_i64(7)?;
+        let target_cid = builder.finish_word(&[], &[TypeTag::I64], Some("demo/target"))?;
+
+        // caller word uses APPLY agent
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[])?;
+        builder.apply_quotation(target_cid, &[], &[TypeTag::I64], &[], None)?;
+        let caller_cid = builder.finish_word(&[], &[TypeTag::I64], Some("demo/apply"))?;
+
+        let outputs = run_word(&conn, &caller_cid, &[])?;
+        assert_eq!(outputs, vec![Value::I64(7)]);
         Ok(())
     }
 }

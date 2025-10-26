@@ -26,6 +26,12 @@ pub enum NodePayload {
     Arg(u32),
     Global([u8; 32]),
     Return,
+    Quote([u8; 32]),
+    Apply {
+        qid: [u8; 32],
+        type_key: Option<[u8; 32]>,
+    },
+    Empty,
 }
 
 /// Minimal node kinds currently implemented.
@@ -37,6 +43,10 @@ pub enum NodeKind {
     Arg,
     LoadGlobal,
     Return,
+    Pair,
+    Unpair,
+    Quote,
+    Apply,
 }
 
 /// Fully described node ready for canonical encoding.
@@ -98,6 +108,10 @@ pub fn encode(node: &NodeCanon) -> Result<Vec<u8>> {
             NodeKind::Arg => "ARG",
             NodeKind::LoadGlobal => "LOAD_GLOBAL",
             NodeKind::Return => "RETURN",
+            NodeKind::Pair => "PAIR",
+            NodeKind::Unpair => "UNPAIR",
+            NodeKind::Quote => "QUOTE",
+            NodeKind::Apply => "APPLY",
         },
     );
 
@@ -120,7 +134,7 @@ pub fn encode(node: &NodeCanon) -> Result<Vec<u8>> {
         }
         _ => {
             push_text(&mut buf, "in");
-            encode_inputs_sorted(&mut buf, &node.inputs);
+            encode_inputs_preserve(&mut buf, &node.inputs);
         }
     }
 
@@ -193,6 +207,24 @@ fn encode_payload(buf: &mut Vec<u8>, payload: &NodePayload) {
             push_map(buf, 0);
             return;
         }
+        NodePayload::Apply { qid, type_key } => {
+            let mut map_len = 1;
+            if type_key.is_some() {
+                map_len += 1;
+            }
+            push_map(buf, map_len);
+            push_text(buf, "qid");
+            push_bytes(buf, qid);
+            if let Some(key) = type_key {
+                push_text(buf, "type_key");
+                push_bytes(buf, key);
+            }
+            return;
+        }
+        NodePayload::Empty => {
+            push_map(buf, 0);
+            return;
+        }
         _ => push_map(buf, 1),
     }
     match payload {
@@ -217,6 +249,12 @@ fn encode_payload(buf: &mut Vec<u8>, payload: &NodePayload) {
             push_bytes(buf, cid);
         }
         NodePayload::Return => {}
+        NodePayload::Quote(cid) => {
+            push_text(buf, "quote");
+            push_bytes(buf, cid);
+        }
+        NodePayload::Apply { .. } => unreachable!(),
+        NodePayload::Empty => unreachable!(),
     }
 }
 
@@ -280,6 +318,18 @@ fn validate_node(node: &NodeCanon) -> Result<()> {
             _ => bail!("LOAD_GLOBAL node requires a global payload"),
         },
         NodeKind::Return => Ok(()),
+        NodeKind::Pair | NodeKind::Unpair => match node.payload {
+            NodePayload::Empty => Ok(()),
+            _ => bail!("PAIR/UNPAIR nodes must not carry payload"),
+        },
+        NodeKind::Quote => match node.payload {
+            NodePayload::Quote(_) => Ok(()),
+            _ => bail!("QUOTE node requires a quote payload"),
+        },
+        NodeKind::Apply => match node.payload {
+            NodePayload::Apply { .. } => Ok(()),
+            _ => bail!("APPLY node requires an apply payload"),
+        },
     }
 }
 
@@ -379,7 +429,7 @@ mod tests {
                 _ => panic!("input entry must be map"),
             })
             .collect();
-        assert_eq!(ports, vec![0, 1]);
+        assert_eq!(ports, vec![1, 0]);
         assert_eq!(
             fields.get("out"),
             Some(&Value::Array(vec![Value::Text("i64".to_string())]))
@@ -395,5 +445,49 @@ mod tests {
             _ => panic!("effect entry should be bytes"),
         };
         assert_eq!(effect_bytes.len(), 32);
+    }
+
+    #[test]
+    fn encode_quote_node() {
+        let node = NodeCanon {
+            kind: NodeKind::Quote,
+            ty: None,
+            out: vec!["ptr".to_string()],
+            inputs: Vec::new(),
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Quote([0x42; 32]),
+        };
+        let encoded = encode(&node).unwrap();
+        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
+        let entries = match value {
+            Value::Map(entries) => entries,
+            _ => panic!("quote node should encode to map"),
+        };
+        let mut map = std::collections::BTreeMap::new();
+        for (k, v) in entries {
+            if let Value::Text(key) = k {
+                map.insert(key, v);
+            }
+        }
+        assert_eq!(map.get("nk"), Some(&Value::Text("QUOTE".to_string())));
+        assert_eq!(
+            map.get("out"),
+            Some(&Value::Array(vec![Value::Text("ptr".to_string())]))
+        );
+        let payload = map.get("pl").expect("payload present");
+        let payload_map = match payload {
+            Value::Map(entries) => entries,
+            _ => panic!("payload must be map"),
+        };
+        let quote_bytes = payload_map
+            .iter()
+            .find_map(|(k, v)| match (k, v) {
+                (Value::Text(key), Value::Bytes(bytes)) if key == "quote" => Some(bytes.clone()),
+                _ => None,
+            })
+            .expect("quote bytes present");
+        assert_eq!(quote_bytes.len(), 32);
     }
 }

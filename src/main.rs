@@ -11,8 +11,8 @@ use march5::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use march5::prim::{self, PrimCanon};
 use march5::word::{self, WordCanon};
 use march5::{
-    TypeTag, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store, put_name,
-    run_word_i64,
+    TypeTag, Value, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store,
+    put_name, run_word,
 };
 
 #[derive(Parser)]
@@ -746,8 +746,20 @@ fn cmd_run(store: &Path, name: &str, args: &[i64]) -> Result<()> {
     let conn = open_store(store)?;
     let word_cid =
         get_name(&conn, "word", name)?.ok_or_else(|| anyhow!("word `{name}` not found"))?;
-    let result = run_word_i64(&conn, &word_cid, args)?;
-    println!("{result}");
+    let arg_values: Vec<Value> = args.iter().copied().map(Value::I64).collect();
+    let outputs = run_word(&conn, &word_cid, &arg_values)?;
+    match outputs.len() {
+        0 => println!("()"),
+        1 => println!("{}", outputs[0]),
+        _ => {
+            let body = outputs
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("({body})");
+        }
+    }
     Ok(())
 }
 
