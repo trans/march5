@@ -3,8 +3,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::cbor::{push_array, push_bytes, push_map, push_text};
-use crate::types::encode_type_signature;
+use crate::cbor::{push_array, push_bytes, push_text};
 use crate::{cid, store};
 
 /// A single symbol exported by an interface.
@@ -31,14 +30,9 @@ pub struct IfaceStoreOutcome {
 /// Encode an interface into canonical CBOR.
 pub fn encode(iface: &IfaceCanon) -> Vec<u8> {
     let mut buf = Vec::new();
-    push_map(&mut buf, 2);
-
-    push_text(&mut buf, "kind");
-    push_text(&mut buf, "iface");
-
-    push_text(&mut buf, "names");
+    push_array(&mut buf, 2);
+    crate::cbor::push_u32(&mut buf, 3); // object tag for "iface"
     encode_names(&mut buf, &iface.names);
-
     buf
 }
 
@@ -84,25 +78,23 @@ fn encode_names(buf: &mut Vec<u8>, names: &[IfaceSymbol]) {
 
     push_array(buf, sorted.len() as u64);
     for symbol in sorted {
-        let has_effects = !symbol.effects.is_empty();
-        push_map(buf, if has_effects { 3 } else { 2 });
-
-        push_text(buf, "name");
         push_text(buf, &symbol.name);
 
-        push_text(buf, "type");
-        let param_refs: Vec<&str> = symbol.params.iter().map(|s| s.as_str()).collect();
-        let result_refs: Vec<&str> = symbol.results.iter().map(|s| s.as_str()).collect();
-        encode_type_signature(buf, &param_refs, &result_refs);
+        push_array(buf, symbol.params.len() as u64);
+        for param in &symbol.params {
+            push_text(buf, param);
+        }
 
-        if has_effects {
-            push_text(buf, "effects");
-            let mut effects = symbol.effects.clone();
-            effects.sort_by(|a, b| a.cmp(b));
-            push_array(buf, effects.len() as u64);
-            for effect in effects {
-                push_bytes(buf, &effect);
-            }
+        push_array(buf, symbol.results.len() as u64);
+        for result in &symbol.results {
+            push_text(buf, result);
+        }
+
+        let mut effects = symbol.effects.clone();
+        effects.sort();
+        push_array(buf, effects.len() as u64);
+        for effect in effects {
+            push_bytes(buf, &effect);
         }
     }
 }
@@ -111,7 +103,7 @@ fn encode_names(buf: &mut Vec<u8>, names: &[IfaceSymbol]) {
 mod tests {
     use super::*;
     use crate::store;
-    use crate::types::TypeTag;
+    use crate::types::{TypeTag, effect_mask};
     use crate::word::{WordCanon, store_word};
 
     #[test]
@@ -133,7 +125,6 @@ mod tests {
             ],
         };
         let encoded = encode(&iface);
-        // Ensure "hello" appears before "world" in encoded bytes
         let hello_pos = encoded
             .windows(b"hello".len())
             .position(|w| w == b"hello")
@@ -155,6 +146,7 @@ mod tests {
             params: vec![TypeTag::I64.as_atom().to_string()],
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: effects.clone(),
+            effect_mask: effect_mask::IO,
         };
         let outcome = store_word(&conn, &word)?;
         let iface = derive_from_exports(&conn, &[("add".into(), outcome.cid)])?;

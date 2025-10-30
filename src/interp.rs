@@ -1,16 +1,19 @@
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::str;
 
 use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
+use serde_cbor::Value as CborValue;
 use std::fmt;
 
 use crate::exec::{compiled_add, compiled_sub};
 use crate::prim::load_prim_info;
+use crate::types::{TypeTag, effect_mask, mask_has};
 use crate::word::load_word_info;
-use crate::{TypeTag, cid, list_names_for_cid, load_object_cbor};
+use crate::{cid, list_names_for_cid, load_object_cbor};
 
 /// Evaluates a word and returns its single `i64` result.
 /// Currently supports words whose parameters and results are all `i64`.
@@ -34,7 +37,12 @@ pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32], args: &[i64]) -> Res
     }
     let arg_values: Vec<Value> = args.iter().copied().map(Value::I64).collect();
     let mut results = run_word_with_info(conn, &info, &arg_values)?;
-    if !info.effects.is_empty() {
+    let expects_token = if info.effect_mask == effect_mask::NONE {
+        !info.effects.is_empty()
+    } else {
+        mask_has(info.effect_mask, effect_mask::IO)
+    };
+    if expects_token {
         match results.first() {
             Some(Value::Token) => {
                 results.remove(0);
@@ -81,7 +89,11 @@ fn run_word_with_info(
     }
     let mut cache: HashMap<[u8; 32], Vec<Value>> = HashMap::new();
     let outputs = eval_return(conn, &info.root, &mut cache, args, &info.results)?;
-    let has_token = !info.effects.is_empty();
+    let has_token = if info.effect_mask == effect_mask::NONE {
+        !info.effects.is_empty()
+    } else {
+        mask_has(info.effect_mask, effect_mask::IO)
+    };
     if has_token {
         match outputs.first() {
             Some(Value::Token) => {}
@@ -115,65 +127,26 @@ fn run_word_with_info(
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
-struct NodeRecord {
-    kind: String,
-    #[serde(rename = "nk")]
-    nk: String,
-    #[serde(default)]
-    #[allow(dead_code)]
-    ty: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    out: Option<Vec<String>>,
-    #[serde(default, rename = "in")]
-    inputs: Vec<NodeInputRecord>,
-    #[serde(default)]
-    vals: Vec<NodeInputRecord>,
-    #[serde(default)]
-    deps: Vec<NodeInputRecord>,
-    #[serde(default)]
-    eff: Vec<ByteBuf>,
-    #[serde(rename = "pl")]
-    payload: NodePayloadRecord,
-}
+struct NodeRecord(
+    u64,
+    u64,
+    Vec<NodeInputRecord>,
+    Vec<String>,
+    Vec<ByteBuf>,
+    CborValue,
+);
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
-struct NodeInputRecord {
-    cid: ByteBuf,
-    port: u32,
-}
+struct NodeInputRecord(ByteBuf, u32);
 
-#[derive(Deserialize, Default)]
-#[allow(dead_code)]
-struct NodePayloadRecord {
-    #[serde(default)]
-    lit: Option<i64>,
-    #[serde(default)]
-    prim: Option<ByteBuf>,
-    #[serde(default)]
-    arg: Option<u32>,
-    #[serde(default)]
-    word: Option<ByteBuf>,
-    #[serde(default)]
-    glob: Option<ByteBuf>,
-    #[serde(default)]
-    quote: Option<ByteBuf>,
-    #[serde(default, rename = "qid")]
-    apply_qid: Option<ByteBuf>,
-    #[serde(default, rename = "type_key")]
-    apply_type_key: Option<ByteBuf>,
-    #[serde(default, rename = "true")]
-    if_true: Option<NodeInputRecord>,
-    #[serde(default, rename = "false")]
-    if_false: Option<NodeInputRecord>,
-    #[serde(default, rename = "guard_type")]
-    guard_type: Option<ByteBuf>,
-    #[serde(default, rename = "match")]
-    guard_match: Option<NodeInputRecord>,
-    #[serde(default, rename = "else")]
-    guard_else: Option<NodeInputRecord>,
+impl NodeInputRecord {
+    fn cid_array(&self) -> Result<[u8; 32]> {
+        bytebuf_to_array(&self.0)
+    }
+
+    fn port(&self) -> u32 {
+        self.1
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -233,44 +206,23 @@ fn eval_node(
     }
 
     let (_, cbor) = load_object_cbor(conn, node_cid)?;
-    let record: NodeRecord = serde_cbor::from_slice(&cbor)?;
-    if record.kind != "node" {
+    let NodeRecord(tag, kind_tag, inputs_raw, out_types, _effects_raw, payload_val) =
+        serde_cbor::from_slice(&cbor)?;
+    if tag != 6 {
         bail!("object {} is not a node", cid::to_hex(node_cid));
     }
 
-    let values = match record.nk.as_str() {
-        "LIT" => {
-            let lit = record
-                .payload
-                .lit
-                .ok_or_else(|| anyhow!("LIT node missing literal payload"))?;
+    let has_token_out = out_types.first().map(|s| s == "token").unwrap_or(false);
+
+    let mut inputs = eval_inputs(conn, &inputs_raw, cache, args)?;
+
+    let values = match kind_tag {
+        0 => {
+            let lit = cbor_to_i64(&payload_val, "LIT payload")?;
             vec![Value::I64(lit)]
         }
-        "ARG" => {
-            let index = record
-                .payload
-                .arg
-                .ok_or_else(|| anyhow!("ARG node missing index payload"))?
-                as usize;
-            let value = args
-                .get(index)
-                .cloned()
-                .ok_or_else(|| anyhow!("argument {index} not supplied"))?;
-            vec![value]
-        }
-        "PRIM" => {
-            let mut inputs = eval_inputs(conn, &record.inputs, cache, args)?;
-            let prim_cid_buf = record
-                .payload
-                .prim
-                .ok_or_else(|| anyhow!("PRIM node missing primitive payload"))?;
-            let prim_cid = bytebuf_to_array(&prim_cid_buf)?;
-            let has_token_out = record
-                .out
-                .as_ref()
-                .and_then(|outs| outs.first())
-                .map(|s| s == "token")
-                .unwrap_or(false);
+        1 => {
+            let prim_cid = cbor_to_bytes32(&payload_val, "PRIM payload")?;
             if has_token_out {
                 match inputs.pop() {
                     Some(Value::Token) => {}
@@ -284,19 +236,8 @@ fn eval_node(
             outputs.push(eval_primitive(conn, &prim_cid, inputs)?);
             outputs
         }
-        "CALL" => {
-            let mut inputs = eval_inputs(conn, &record.inputs, cache, args)?;
-            let word_buf = record
-                .payload
-                .word
-                .ok_or_else(|| anyhow!("CALL node missing word payload"))?;
-            let word_cid = bytebuf_to_array(&word_buf)?;
-            let has_token_out = record
-                .out
-                .as_ref()
-                .and_then(|outs| outs.first())
-                .map(|s| s == "token")
-                .unwrap_or(false);
+        2 => {
+            let word_cid = cbor_to_bytes32(&payload_val, "CALL payload")?;
             if has_token_out {
                 match inputs.pop() {
                     Some(Value::Token) => {}
@@ -309,126 +250,80 @@ fn eval_node(
             }
             outputs
         }
-        "PAIR" => {
-            let inputs = eval_inputs(conn, &record.inputs, cache, args)?;
+        3 => {
+            let index = cbor_to_u32(&payload_val, "ARG payload")? as usize;
+            let value = args
+                .get(index)
+                .cloned()
+                .ok_or_else(|| anyhow!("argument {index} not supplied"))?;
+            vec![value]
+        }
+        4 => bail!("LOAD_GLOBAL not supported by runner (yet)"),
+        5 => bail!("RETURN node should be handled at word entry"),
+        6 => {
             if inputs.len() != 2 {
-                bail!(
-                    "PAIR node requires exactly two inputs, found {}",
-                    inputs.len()
-                );
+                bail!("PAIR node expects two inputs, found {}", inputs.len());
             }
             vec![Value::Tuple(inputs)]
         }
-        "UNPAIR" => {
-            if record.inputs.len() != 1 {
-                bail!(
-                    "UNPAIR node requires exactly one input, found {}",
-                    record.inputs.len()
-                );
+        7 => {
+            if inputs.len() != 1 {
+                bail!("UNPAIR node expects one input, found {}", inputs.len());
             }
-            let input_value = eval_input(conn, &record.inputs[0], cache, args)?;
-            match input_value {
+            match inputs.pop().unwrap() {
                 Value::Tuple(values) => values,
-                other => bail!("UNPAIR expected tuple value, got {:?}", other),
+                other => bail!("UNPAIR expected tuple input, got {:?}", other.type_tag()),
             }
         }
-        "QUOTE" => {
-            let quote_buf = record
-                .payload
-                .quote
-                .ok_or_else(|| anyhow!("QUOTE node missing quotation payload"))?;
-            let qid = bytebuf_to_array(&quote_buf)?;
-            vec![Value::Quote(qid)]
+        8 => {
+            let quote_cid = cbor_to_bytes32(&payload_val, "QUOTE payload")?;
+            vec![Value::Quote(quote_cid)]
         }
-        "APPLY" => {
-            let mut inputs = eval_inputs(conn, &record.inputs, cache, args)?;
-            let qid_buf = record
-                .payload
-                .apply_qid
-                .ok_or_else(|| anyhow!("APPLY node missing qid payload"))?;
-            let qid = bytebuf_to_array(&qid_buf)?;
-            let has_token_out = record
-                .out
-                .as_ref()
-                .and_then(|outs| outs.first())
-                .map(|s| s == "token")
-                .unwrap_or(false);
-            if has_token_out {
-                match inputs.pop() {
-                    Some(Value::Token) => {}
-                    _ => bail!("APPLY node missing token input"),
-                }
-            }
-            let mut outputs = run_word(conn, &qid, &inputs)?;
-            if has_token_out {
-                outputs.insert(0, Value::Token);
-            }
-            outputs
+        9 => {
+            let (qid, type_key) = cbor_to_apply_payload(&payload_val)?;
+            eval_apply(conn, &qid, type_key, &mut inputs)?
         }
-        "TOKEN" => vec![Value::Token],
-        "GUARD" => {
-            if record.inputs.len() != 1 {
-                bail!(
-                    "GUARD node requires exactly one input, found {}",
-                    record.inputs.len()
-                );
-            }
-            let guard_type_bytes = record
-                .payload
-                .guard_type
-                .as_ref()
-                .ok_or_else(|| anyhow!("GUARD node missing type key payload"))?;
-            let expected_tag = decode_guard_type_key(guard_type_bytes.as_ref())?;
-
-            let input_value = eval_input(conn, &record.inputs[0], cache, args)?;
-            let matches = input_value.type_tag() == expected_tag;
-            let branch = if matches {
-                record
-                    .payload
-                    .guard_match
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("GUARD missing match continuation"))?
-            } else {
-                record
-                    .payload
-                    .guard_else
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("GUARD missing else continuation"))?
-            };
-            vec![eval_input(conn, branch, cache, args)?]
-        }
-        "DEOPT" => bail!("deopt triggered"),
-        "IF" => {
-            if record.inputs.len() != 1 {
+        10 => {
+            if inputs_raw.len() != 1 {
                 bail!(
                     "IF node requires exactly one condition input, found {}",
-                    record.inputs.len()
+                    inputs_raw.len()
                 );
             }
-            let cond_value = eval_input(conn, &record.inputs[0], cache, args)?;
+            let cond_value = inputs
+                .drain(..1)
+                .next()
+                .ok_or_else(|| anyhow!("IF missing evaluated condition"))?;
             let cond_truth = match cond_value {
                 Value::I64(n) => n != 0,
                 _ => bail!("IF condition must be i64 (0/!=0)"),
             };
+            let branches = cbor_to_inputs(&payload_val, "IF payload")?;
+            if branches.len() != 2 {
+                bail!("IF payload must contain exactly two continuations");
+            }
             let branch = if cond_truth {
-                record
-                    .payload
-                    .if_true
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("IF missing true continuation"))?
+                &branches[0]
             } else {
-                record
-                    .payload
-                    .if_false
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("IF missing false continuation"))?
+                &branches[1]
             };
             let result = eval_input(conn, branch, cache, args)?;
             vec![result]
         }
-        "RETURN" => bail!("RETURN node should be handled at word entry"),
-        "LOAD_GLOBAL" => bail!("LOAD_GLOBAL not supported by runner (yet)"),
-        kind => bail!("unsupported node kind `{kind}` in runner"),
+        11 => vec![Value::Token],
+        12 => {
+            let (type_key, match_input, else_input) = cbor_to_guard_payload(&payload_val)?;
+            let expected_tag = decode_guard_type_key(&type_key)?;
+            let input_value = inputs
+                .drain(..1)
+                .next()
+                .ok_or_else(|| anyhow!("GUARD missing evaluated input"))?;
+            let matches = input_value.type_tag() == expected_tag;
+            let branch = if matches { match_input } else { else_input };
+            vec![eval_input(conn, &branch, cache, args)?]
+        }
+        13 => bail!("deopt triggered"),
+        other => bail!("unsupported node kind tag `{other}` in runner"),
     };
 
     cache.insert(*node_cid, values.clone());
@@ -443,31 +338,33 @@ fn eval_return(
     expected_results: &[TypeTag],
 ) -> Result<Vec<Value>> {
     let (_, cbor) = load_object_cbor(conn, root)?;
-    let record: NodeRecord = serde_cbor::from_slice(&cbor)?;
-    if record.kind != "node" {
+    let NodeRecord(tag, kind_tag, _inputs_raw, _out_types, _effects_raw, payload_val) =
+        serde_cbor::from_slice(&cbor)?;
+    if tag != 6 {
         bail!("root object {} is not a node", cid::to_hex(root));
     }
 
-    if record.nk != "RETURN" {
+    if kind_tag != 5 {
         // Legacy root without RETURN.
         let values = eval_node(conn, root, cache, args)?;
         return Ok(values);
     }
 
-    if record.vals.len() != expected_results.len() {
+    let (vals_raw, deps_raw) = cbor_to_return_payload(&payload_val)?;
+    if vals_raw.len() != expected_results.len() {
         bail!(
             "RETURN node value count {} does not match declared results {}",
-            record.vals.len(),
+            vals_raw.len(),
             expected_results.len()
         );
     }
 
-    for dep in &record.deps {
+    for dep in &deps_raw {
         let _ = eval_input(conn, dep, cache, args)?;
     }
 
-    let mut outputs = Vec::with_capacity(record.vals.len());
-    for input in &record.vals {
+    let mut outputs = Vec::with_capacity(vals_raw.len());
+    for input in &vals_raw {
         let value = eval_input(conn, input, cache, args)?;
         outputs.push(value);
     }
@@ -493,13 +390,121 @@ fn eval_input(
     cache: &mut HashMap<[u8; 32], Vec<Value>>,
     args: &[Value],
 ) -> Result<Value> {
-    let input_cid = bytebuf_to_array(&record.cid)?;
+    let input_cid = record.cid_array()?;
     let outputs = eval_node(conn, &input_cid, cache, args)?;
-    let port = record.port as usize;
+    let port = record.port() as usize;
     outputs
         .get(port)
         .cloned()
         .ok_or_else(|| anyhow!("node {} missing port {port}", cid::to_hex(&input_cid)))
+}
+
+fn cbor_to_i64(value: &CborValue, context: &str) -> Result<i64> {
+    match value {
+        CborValue::Integer(n) => match i64::try_from(*n) {
+            Ok(value) => Ok(value),
+            Err(_) => bail!("{context} integer out of range for i64"),
+        },
+        other => bail!("{context} expected integer, found {other:?}"),
+    }
+}
+
+fn cbor_to_u32(value: &CborValue, context: &str) -> Result<u32> {
+    let n = cbor_to_i64(value, context)?;
+    if n < 0 {
+        bail!("{context} must be non-negative");
+    }
+    Ok(n as u32)
+}
+
+fn cbor_to_bytes32(value: &CborValue, context: &str) -> Result<[u8; 32]> {
+    match value {
+        CborValue::Bytes(bytes) => {
+            if bytes.len() != 32 {
+                bail!("{context} must be 32 bytes, found {}", bytes.len());
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(bytes);
+            Ok(arr)
+        }
+        other => bail!("{context} expected bytes, found {other:?}"),
+    }
+}
+
+fn cbor_to_input_record(value: &CborValue, context: &str) -> Result<NodeInputRecord> {
+    match value {
+        CborValue::Array(items) if items.len() == 2 => {
+            let cid = match &items[0] {
+                CborValue::Bytes(bytes) => ByteBuf::from(bytes.clone()),
+                other => bail!("{context} entry expected bytes, found {other:?}"),
+            };
+            let port = cbor_to_u32(&items[1], context)?;
+            Ok(NodeInputRecord(cid, port))
+        }
+        other => bail!("{context} expected [cid, port] array, found {other:?}"),
+    }
+}
+
+fn cbor_to_inputs(value: &CborValue, context: &str) -> Result<Vec<NodeInputRecord>> {
+    match value {
+        CborValue::Array(items) => items
+            .iter()
+            .map(|entry| cbor_to_input_record(entry, context))
+            .collect(),
+        other => bail!("{context} expected array, found {other:?}"),
+    }
+}
+
+fn cbor_to_apply_payload(value: &CborValue) -> Result<([u8; 32], Option<[u8; 32]>)> {
+    match value {
+        CborValue::Array(items) if items.len() == 1 => {
+            let qid = cbor_to_bytes32(&items[0], "APPLY qid")?;
+            Ok((qid, None))
+        }
+        CborValue::Array(items) if items.len() == 2 => {
+            let qid = cbor_to_bytes32(&items[0], "APPLY qid")?;
+            let type_key = cbor_to_bytes32(&items[1], "APPLY type key")?;
+            Ok((qid, Some(type_key)))
+        }
+        other => bail!("APPLY payload expected [qid] or [qid, type_key], found {other:?}"),
+    }
+}
+
+fn cbor_to_guard_payload(
+    value: &CborValue,
+) -> Result<([u8; 32], NodeInputRecord, NodeInputRecord)> {
+    match value {
+        CborValue::Array(items) if items.len() == 3 => {
+            let type_key = cbor_to_bytes32(&items[0], "GUARD type key")?;
+            let match_input = cbor_to_input_record(&items[1], "GUARD match continuation")?;
+            let else_input = cbor_to_input_record(&items[2], "GUARD else continuation")?;
+            Ok((type_key, match_input, else_input))
+        }
+        other => bail!("GUARD payload expected [type_key, match, else], found {other:?}"),
+    }
+}
+
+fn cbor_to_return_payload(
+    value: &CborValue,
+) -> Result<(Vec<NodeInputRecord>, Vec<NodeInputRecord>)> {
+    match value {
+        CborValue::Array(items) if items.len() == 2 => {
+            let vals = cbor_to_inputs(&items[0], "RETURN vals")?;
+            let deps = cbor_to_inputs(&items[1], "RETURN deps")?;
+            Ok((vals, deps))
+        }
+        other => bail!("RETURN payload expected [vals, deps], found {other:?}"),
+    }
+}
+
+fn eval_apply(
+    conn: &Connection,
+    qid: &[u8; 32],
+    _type_key: Option<[u8; 32]>,
+    inputs: &mut Vec<Value>,
+) -> Result<Vec<Value>> {
+    let args = std::mem::take(inputs);
+    run_word(conn, qid, &args)
 }
 
 fn value_to_i64(value: &Value) -> Result<i64> {
@@ -577,7 +582,7 @@ mod tests {
     use crate::builder::GraphBuilder;
     use crate::node::{NodeCanon, NodeInput, NodeKind, NodePayload};
     use crate::store;
-    use crate::types::TypeTag;
+    use crate::types::{TypeTag, effect_mask};
 
     fn guard_key(tag: TypeTag) -> [u8; 32] {
         let mut bytes = [0u8; 32];
@@ -705,6 +710,7 @@ mod tests {
             params: Vec::new(),
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: Vec::new(),
+            effect_mask: effect_mask::NONE,
         };
         let word_cid = crate::word::store_word(&conn, &word)?.cid;
 
@@ -799,6 +805,7 @@ mod tests {
             params: Vec::new(),
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: Vec::new(),
+            effect_mask: effect_mask::NONE,
         };
         let word_cid = crate::word::store_word(&conn, &word)?.cid;
 
@@ -893,6 +900,7 @@ mod tests {
             params: Vec::new(),
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: Vec::new(),
+            effect_mask: effect_mask::NONE,
         };
         let word_cid = crate::word::store_word(&conn, &word)?.cid;
 
@@ -986,6 +994,7 @@ mod tests {
             params: Vec::new(),
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: Vec::new(),
+            effect_mask: effect_mask::NONE,
         };
         let word_cid = crate::word::store_word(&conn, &word)?.cid;
 

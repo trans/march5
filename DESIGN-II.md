@@ -49,14 +49,14 @@ Interfaces describe what a namespace promises to export:
 
   {
     "kind": "interface",
-    "symbols": [
+    "names": [
       { "name": "hello",   "type": { "params": [], "results": ["unit"] }, "effects": ["io"] },
       { "name": "goodbye", "type": { "params": ["str"], "results": ["unit"] }, "effects": ["io"] }
     ]
   }
 
 Canonicalization rules:
-  - `symbols` sorted lexicographically by `name`.
+  - `names` sorted lexicographically by `name`.
   - `effects` sorted.
   - Omit empty arrays.
 
@@ -64,7 +64,13 @@ Hashing this CBOR yields the Interface CID used in `bindings` and in the namespa
 
 During compilation the interface can be synthesized automatically by inspecting
 each exported word: lift its parameter/result types and accumulated effect set
-into the \`symbols\` array so the contract always mirrors the actual graph semantics.
+into the `names` array so the contract always mirrors the actual graph semantics.
+
+> **Terminology note:** entries are stored under `names` rather than `words`
+> to avoid clashing with the canonical `word` objects themselves and to leave
+> room for future exports that are not direct word entrypoints (e.g., globals or
+> dict entries). Tooling should treat each `name` record as a reference to a
+> concrete word CID.
 
 ### RAM View (Compiler-only)
 
@@ -176,8 +182,16 @@ For deterministic hashing, all canonical objects MUST encode keys in the exact o
 ### Node (already implemented)
 kind, nk, ty, in, eff (omit if empty), pl
 
+Field abbreviations keep the canonical encoding compact:
+- `kind`: literal `"node"` discriminator shared by all node objects.
+- `nk`: node kind tag (e.g., `LIT`, `PRIM`, `CALL`).
+- `ty`: legacy single-result type atom (left temporarily for backward compatibility; superseded by `out`).
+- `in`: ordered list of input edges (producer CID + port).
+- `eff`: sorted effect CID list attached to the node; omitted when empty.
+- `pl`: payload map specific to the node kind (e.g., literal value, prim CID).
+
 ### Interface
-kind, symbols
+kind, names
 
 ### Namespace
 kind, bindings, exports, interface
@@ -198,7 +212,7 @@ Canonical objects MUST satisfy:
 - A namespace MAY have zero exports (not an error).
 
 ### Interface
-- symbols MUST be sorted lexicographically by name.
+- names MUST be sorted lexicographically by name.
 - effects arrays MUST be sorted.
 - omit empty arrays.
 
@@ -242,8 +256,8 @@ Lockfiles improve reproducibility and prevent silent provider substitution.
   - Human **names** and `use` aliases are non-canonical metadata.
 
 - **Interface** (compile-time, CID’d object)
-  - The **contract** a namespace promises: for each exported symbol, its **name**, **type signature**, and **effect set**.
-  - Canonical fields: `symbols` (sorted).
+  - The **contract** a namespace promises: for each exported entry, its **name**, **type signature**, and **effect set**.
+  - Canonical fields: `names` (sorted).
   - Hash of the canonical encoding = **interface CID**.
 
 - **Effects** (semantic capability labels)
@@ -275,7 +289,7 @@ It is **not** a list of specific symbol→CID pairs. Symbol-level identity alrea
 
 ### Validation
 
-- Interface `symbols` are sorted by `name`; each symbol encodes:
+- Interface `names` are sorted by `name`; each entry encodes:
   - `params` (type tags),
   - `results` (type tags),
   - `effects` (sorted list of effect IDs; see encoding below).
@@ -298,15 +312,15 @@ Effects are identity-bearing. Use **effect CIDs** (32-byte) in canonical form (s
 (If you later standardize a small core set, you can map well-known effect CIDs to 1-byte codes in encoding, without changing semantics.)
 
 ### Canonical key order
-- Interface object keys in this exact order: `kind`, `symbols`.
-- Symbol entries use arrays (no per-entry key repetition).
+- Interface object keys in this exact order: `kind`, `names`.
+- Name entries use arrays (no per-entry key repetition).
 
 ### Canonical interface (compact form)
 
 Readable shape:
   kind = "interface"
-  symbols = [
-    // each symbol is: [ name, params[], results[], effects[] ]
+  names = [
+    // each entry is: [ name, params[], results[], effects[] ]
     [ "print", ["str"], ["unit"], [ <ioEffectCID> ] ],
     [ "read",  [],      ["str"],  [ <ioEffectCID> ] ]
   ]
@@ -314,22 +328,22 @@ Readable shape:
 CBOR-friendly shape (pseudocode):
   {
     "kind": "interface",
-    "symbols": [
+    "names": [
       [ text(name), array(param_type_atoms), array(result_type_atoms), array(effectCIDs) ],
       ...
     ]
   }
 
 Notes:
-- `symbols` sorted by `name`.
+- `names` sorted by `name`.
 - `effects` sorted lexicographically by CID bytes.
-- Omit nothing inside symbol entries (always 4 items) for stable layout.
+- Omit nothing inside each entry (always 4 items) for stable layout.
 
 ### Example (human-readable, compact)
 
   {
     "kind": "interface",
-    "symbols": [
+    "names": [
       [ "print", ["str"], ["unit"], [ "EFFECT:IO:CID" ] ],
       [ "read",  [],      ["str"],  [ "EFFECT:IO:CID" ] ]
     ]
@@ -341,16 +355,16 @@ This keeps identity precise, while the encoding is small and consistent.
 
 ---
 
-## Why not a string-inflated map per symbol?
+## Why not a string-inflated map per entry?
 
-Maps would repeat keys (`"name"`, `"type"`, `"effects"`) for every symbol.  
+Maps would repeat keys (`"name"`, `"type"`, `"effects"`) for every export entry.  
 Array entries avoid that repetition, speed up parsing, and reduce hashing ambiguity.
 
 ---
 
 ## Practical loader tips
 
-- Validate determinism: reject unsorted `symbols` or `effects`.
+- Validate determinism: reject unsorted `names` or `effects`.
 - Keep a tiny table mapping type atoms (`"i64"`, `"str"`, …) → `TypeTag` enum at load time.
 - Effects in RAM can be a **bitmask** for scheduling, but the canonical object stores the **CIDs**. The bit positions should be derived from a stable, global mapping (e.g., ordered by effect CID).
 
@@ -360,4 +374,4 @@ Array entries avoid that repetition, speed up parsing, and reduce hashing ambigu
 
 - Add an optional, non-canonical `"doc"` field for documentation (ignored for hashing).
 - Add an optional `"deprecations"` side table (non-canonical).
-- Add `"symbols_ext"` with extra metadata; keep `"symbols"` as the canonical core.
+- Add `"names_ext"` with extra metadata; keep `"names"` as the canonical core.

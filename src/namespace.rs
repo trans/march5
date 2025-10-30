@@ -3,7 +3,7 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-use crate::cbor::{push_array, push_bytes, push_map, push_text};
+use crate::cbor::{push_array, push_bytes, push_text};
 use crate::{cid, store};
 
 /// Structured namespace before encoding.
@@ -29,20 +29,11 @@ pub struct NamespaceStoreOutcome {
 /// Encode a namespace into canonical CBOR.
 pub fn encode(ns: &NamespaceCanon) -> Vec<u8> {
     let mut buf = Vec::new();
-    push_map(&mut buf, 4);
-
-    push_text(&mut buf, "kind");
-    push_text(&mut buf, "namespace");
-
-    push_text(&mut buf, "imports");
-    encode_cid_list(&mut buf, &ns.imports);
-
-    push_text(&mut buf, "exports");
-    encode_exports(&mut buf, &ns.exports);
-
-    push_text(&mut buf, "iface");
+    push_array(&mut buf, 4);
+    crate::cbor::push_u32(&mut buf, 4); // object tag for "namespace"
     push_bytes(&mut buf, &ns.iface);
-
+    encode_cid_list(&mut buf, &ns.imports);
+    encode_exports(&mut buf, &ns.exports);
     buf
 }
 
@@ -68,10 +59,7 @@ fn encode_exports(buf: &mut Vec<u8>, exports: &[NamespaceExport]) {
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     push_array(buf, sorted.len() as u64);
     for export in sorted {
-        push_map(buf, 2);
-        push_text(buf, "name");
         push_text(buf, &export.name);
-        push_text(buf, "word");
         push_bytes(buf, &export.word);
     }
 }
@@ -97,7 +85,6 @@ mod tests {
             iface: [0xFF; 32],
         };
         let encoded = encode(&ns);
-        // ensure sorted ordering by checking first occurrence of 0x01 before 0x02
         let first_import = encoded
             .windows(32)
             .position(|w| w.iter().all(|byte| *byte == 0x01))
@@ -107,7 +94,6 @@ mod tests {
             .position(|w| w.iter().all(|byte| *byte == 0x02))
             .unwrap();
         assert!(first_import < second_import);
-        assert!(encoded.iter().filter(|&&b| b == 0xFF).count() >= 32);
         let alpha_pos = encoded
             .windows(b"alpha".len())
             .position(|w| w == b"alpha")

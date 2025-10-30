@@ -71,28 +71,34 @@ But code is in a database. Ultimately a DB connected GUI will be built.
 ## 3. Interfaces (Interface CIDs)
 
 ### 3.1 Interface object (`iface`)
-Canonical list of exported symbols with their type signatures and effect sets.
+Canonical list of exported names with their type signatures and effect sets.
+Interfaces use the same compact, positional style:
 
-```json
-{
-  "kind": "iface",
-  "names": [
-    { "name": "hello",
-      "type": { "params": [], "results": ["unit"] },
-      "effects": ["io"]   // effect CIDs
-    }
+```
+[
+  3,  // object tag for "iface"
+  [
+    [ "hello",
+      ["unit"],              // parameter type atoms (temporary strings)
+      ["unit"],              // result type atoms
+      [ <effectCID>, ... ]   // effect CIDs (sorted; omit array when empty)
+    ],
+    ...
   ]
-}
+]
+```
 
-Deterministically sorted by name.
+- Entries are sorted lexicographically by the export name.
+- Effects lists are sorted lexicographically by CID. Elide the inner array when
+  no effects are declared for an export.
+- `ifaceCID = sha256(cbor)`; namespaces store this CID in their canonical
+  payload for compatibility checks.
 
-ifaceCID = sha256(cbor).
-
-Used for compatibility checks and binding imports.
-
-Tooling derives the interface directly from exported words: each word’s
-declared type/effect metadata is lifted into the symbol table so the interface
-automatically reflects capability requirements (e.g., `io`, `heap`).
+Tooling derives the interface directly from exported words: each word’s declared
+type/effect metadata is lifted into the names array so the interface
+automatically reflects capability requirements (e.g., `io`, `heap`). When type
+definitions gain their own CIDs, swap the string atoms for those identifiers
+without changing the array shape.
 
 
 ## 4. Canonical Encodings (CBOR)
@@ -101,104 +107,173 @@ Use DAG-CBOR or a fixed-byte canonical layout. Keys must be emitted in the exact
 
 ### 4.1 prim CBOR
 
-```json
-{
-  "kind": "prim",
-  "type": { "params": ["i64","i64"], "results": ["i64"] },
-  "attrs": {},         // optional; omitted if empty
-  "name": "add_i64"    // NOTE: included for human tooling, but EXCLUDED from CID unless you insist otherwise
-}
+Canonical encoding keeps the bytes minimal and machine-oriented. For primitives
+we serialize a tiny positional array:
+
+```
+[
+  0,                  // object tag for "prim"
+  <rootCID>,          // reserved; 32 zero bytes for primitives
+  ["i64","i64"],      // parameter type atoms (temporary strings until typedef CIDs exist)
+  ["i64"],            // result type atoms
+  [ <effectCID>, ... ]// declared effect CIDs (sorted; omit array when empty)
+]
 ```
 
-CID fields: kind,type,attrs (exclude name for dedup).
+- Attribute maps and human-readable names live outside the CID (e.g. in
+  `name_index` or debug views) and are **not** part of the canonical payload.
+- Effect bitmasks remain a runtime convenience; they are derived from the
+  declared effect CID list and deliberately excluded from the hashed encoding.
+
+Once we have typedef CIDs, format will be:
+
+```
+[
+  0,                                // object tag for "prim"
+  <rootCID>,                        // still zero for primitives
+  [ <typeCID>, <typeCID>, ... ],    // parameter type CIDs
+  [ <typeCID>, ... ],               // result type CIDs
+  [ <effectCID>, ... ]              // declared effect CIDs (sorted; omit array when empty)
+]
+```
 
 ### 4.2 node CBOR
 
-```json
-{
-  "kind": "node",
-  "nk": "PRIM",                 // enum string or small int
-  "ty": "i64",                  // output type tag
-  "in": [                       // sorted by input port index ascending
-    { "cid": "<producerCID>", "port": 0 },
-    { "cid": "<producerCID>", "port": 0 }
-  ],
-  "eff": ["<effectCID>", ...],  // sorted; omit if empty
-  "pl": {                       // payload; exactly one of:
-    "lit": 123,                 // LIT
-    "prim": "<primCID>",        // PRIM
-    "word": "<wordCID>",        // CALL
-    "if": {                     // IF_CALL
-      "cond": "<condNodeCID>",  // when encoded as node-ref (Option B)
-      "true": "<trueThunkCID>",
-      "false": "<falseThunkCID>"
-    },
-    "arg": 0,                   // ARG index
-    "glob": "<globalCID>"       // LOAD_GLOBAL
-  }
-}
+Nodes represent individual Mini-INet agents. The canonical encoding mirrors the
+other objects with a positional array:
+
+```
+[
+  6,                      // object tag for "node"
+  nk,                     // node-kind tag (u8 discriminator; e.g. 0=LIT,1=PRIM,...)
+  [ [cid, port], ... ],   // inputs sorted by (port, cid); empty for RETURN
+  [ <outType>, ... ],     // output type atoms (temporary strings until typedef CIDs exist)
+  [ <effectCID>, ... ],   // declared effect CIDs (sorted; empty array when none)
+  payload                 // kind-specific data (see below)
+]
 ```
 
-For IF_CALL, you have two encodings:
+- Inputs reference producer node CIDs plus port indices; each entry is `[cid,
+  port]` with `cid` as raw bytes and `port` as a small integer.
+- Output types list every result port; include token or tuple types exactly as
+  they surface to callers.
+- Effects array is sorted lexicographically by CID and omitted (encoded as an
+  empty CBOR array) when no effects are declared.
 
-Option A (thunks): pl.if.{true,false} are wordCIDs (preferred).
+**Payload variants**
 
-Option B (structured): represent IF_CTL + inlined branches + PHI (no special payload in IF_CTL).
+The final slot encodes node-specific data:
+
+- `nk = LIT`: payload is the literal value (e.g., CBOR int/float or bytes).
+- `nk = PRIM`: payload is `<primCID>`.
+- `nk = CALL`: payload is `<wordCID>`.
+- `nk = APPLY`: payload is `[ <qid>, <typeKey?> ]` where the second entry is
+  omitted when no specialization key is provided.
+- `nk = ARG`: payload is the zero-based argument index.
+- `nk = LOAD_GLOBAL`: payload is `<globalCID>`.
+- `nk = QUOTE`: payload is `<wordCID>` of the quoted quotation.
+- `nk = IF`: payload is `[ <trueWordCID>, <falseWordCID> ]` (thunk form).
+- `nk = TOKEN`, `nk = DEOPT`, etc.: payload is `null` (or empty array) when no
+  extra data is required.
+- `nk = RETURN`: payload is `[ vals[], deps[] ]`, where `vals` is the ordered
+  list of `[cid, port]` feeding return values and `deps` is the sorted,
+  deduplicated list of `[cid, port]` edges used to sequence side effects.
+
+Return nodes keep their `inputs` array empty; all value and dependency edges
+live in the payload to preserve the shared array shape. Consumers reconstruct
+the execution graph by following these CIDs, enforcing determinism via the
+sorted input/effect/dependency ordering.
+
+When additional node kinds arrive (e.g., structured control), assign the next
+`nk` tag and extend the payload conventions accordingly while preserving the
+positional layout above.
 
 ### 4.3 word CBOR
 
-```json
-{
-  "kind": "word",
-  "root": "<nodeCID>",
-  "type": { "params": [], "results": ["unit"] },
-  "doc": "optional"   // excluded from CID
-}
+Words reuse the same positional layout, with a real root CID referring to the
+RETURN node of the graph:
+
 ```
+[
+  1,                  // object tag for "word"
+  <rootNodeCID>,      // RETURN node CID
+  ["i64","i64"],      // parameter type atoms (temporary strings until typedef CIDs exist)
+  ["i64"],            // result type atoms
+  [ <effectCID>, ... ]// declared effect CIDs (sorted; omit array when empty)
+]
+```
+
+Human-friendly names, documentation strings, or registration aliases remain
+outside the canonical payload (e.g. in `name_index`). When type definitions gain
+their own CIDs, swap the string atoms for those identifiers without changing
+the array shape.
 
 ### 4.4 namespace CBOR
 
-CID fields: kind,imports[].iface,exports[].word,iface.
+Namespaces capture their interface CID, required import interfaces, and the
+current name→word mapping for exported symbols:
 
-```json
-{
-  "kind": "namespace",
- "imports": [ { "name": "io", "iface": "<ifaceCID_io>" } ],   // name optional in CID (exclude for dedup)
- "exports": [ { "name": "hello", "word": "<wordCID_hello>" } ],
- "iface": "<ifaceCID_ns>",
- "name": "lang.march.helloworld.1"  // excluded from CID for dedup; stored in name_index
-}
+```
+[
+  4,                        // object tag for "namespace"
+  <ifaceCID>,               // this namespace's interface CID
+  [ <importIfaceCID>, ... ],// sorted list of required interface CIDs
+  [
+    [ "hello", <wordCID> ], // exports sorted lexicographically by name
+    [ "print", <wordCID> ],
+    ...
+  ]
+]
 ```
 
-> **Note:** When capturing exports via tooling (CLI/REPL), specify them as
-> `symbolName=<wordCID>` pairs. This ensures the canonical `exports[]` entries
-> remain sorted by `symbolName` while keeping the word CID data intact.
+- Namespace names live in `name_index` and remain outside the canonical payload.
+- Import interface CIDs are sorted and deduplicated.
+- Export entries are sorted by the textual name. Only exported words appear;
+  internal words can still be registered directly in `name_index` for advanced
+  use, but they do not affect the namespace CID.
 
 ### 4.5 program CBOR
 
-```json
-{
-  "kind": "program",
-  "entry": { "namespace": "lang.march.helloworld.1", "symbol": "hello" }, // excluded from CID
-  "entry_word": "<wordCID_hello>",   // included in CID
-  "deps": [ "<namespaceCID>", "<namespaceCID_io>" ]  // optional convenience; can be recomputed
-}
+Programs tie together the entry word and the canonical root namespace. The
+canonical payload stays compact:
+
+```
+[
+  5,                  // object tag for "program"
+  <entryWordCID>,     // word invoked as the entry point
+  <rootNamespaceCID>  // canonical namespace CID for the program's root
+]
 ```
 
-CID fields: kind,entry_word.
+- Additional metadata (human-readable program name, author, etc.) lives in
+  `name_index` or side channels.
+- If you later want to capture exact dependency bindings (e.g., a lockfile of
+  resolved namespace CIDs), append another slot with a sorted list
+  `[ <namespaceCID>, ... ]`. Keep it optional so existing tooling can ignore it
+  when not needed.
 
 ### 4.6 global CBOR
 
-```json
-{
-  "kind": "global",
-  "type": "i64",
-  "value": 42                      // or "blob": "<blobRootCID>"
-  // "ns","name" excluded from CID; put in name_index
-}
+Globals may carry scalars or multi-result tuples. Canonical encoding mirrors the
+other objects with a positional array:
+
+```
+[
+  2,                  // object tag for "global"
+  ["i64","i64"],      // result type atoms (temporary strings until typedef CIDs exist)
+  [ 1, 2 ],           // value payload matching the type list
+]
 ```
 
-CID fields: kind,type,value|blob.
+- The value slot is always an array whose length matches the type list. Use a
+  single-element array for scalars to keep the representation uniform.
+- Each entry may be an inline literal (e.g., CBOR int/float) or a CID pointing
+  at a blob object when the payload is large. Future work can define a chunked
+  Merkle layout for those blob CIDs; the global record itself still stores only
+  the root reference.
+- Namespaces/names remain in `name_index`; the canonical payload contains only
+  types and values. When typedef CIDs land, replace the type atoms with those
+  identifiers without changing the array shape.
 
 ## 5. SQLite Schema (single-file store)
 

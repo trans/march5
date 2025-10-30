@@ -9,11 +9,13 @@ use march5::iface::{self, IfaceCanon, IfaceSymbol};
 use march5::namespace::{self, NamespaceCanon, NamespaceExport};
 use march5::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use march5::prim::{self, PrimCanon};
+use march5::types::effect_mask;
 use march5::word::{self, WordCanon};
 use march5::{
     TypeTag, Value, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store,
     put_name, run_word,
 };
+use serde::Deserialize;
 
 #[derive(Parser)]
 #[command(name = "march5", version, about = "March α₅ CLI tooling")]
@@ -98,9 +100,6 @@ enum PrimCommand {
         /// Repeat per result type
         #[arg(long = "result", value_name = "TYPE")]
         results: Vec<String>,
-        /// Optional attribute entries in key=value form
-        #[arg(long = "attr", value_name = "KEY=VALUE")]
-        attrs: Vec<String>,
         /// Declared effect CIDs
         #[arg(long = "effect", value_name = "CID")]
         effects: Vec<String>,
@@ -324,24 +323,22 @@ fn cmd_prim(store: &Path, command: PrimCommand) -> Result<()> {
             name,
             params,
             results,
-            attrs,
             effects,
             no_register,
         } => {
             let conn = open_store(store)?;
-            let attrs_pairs = parse_attrs(&attrs)?;
             let param_tags = parse_type_tags(&params)?;
             let result_tags = parse_type_tags(&results)?;
             let effect_cids = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
-            let attr_refs: Vec<(&str, &str)> = attrs_pairs
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.as_str()))
-                .collect();
             let spec = PrimCanon {
                 params: &param_tags,
                 results: &result_tags,
-                attrs: &attr_refs,
                 effects: effect_cids.as_slice(),
+                effect_mask: if effect_cids.is_empty() {
+                    effect_mask::NONE
+                } else {
+                    effect_mask::IO
+                },
             };
             let outcome = prim::store_prim(&conn, &spec)?;
             if !no_register {
@@ -580,6 +577,11 @@ fn cmd_word(store: &Path, command: WordCommand) -> Result<()> {
                 params,
                 results,
                 effects: parse_cid_list(effects.iter().map(|s| s.as_str()))?,
+                effect_mask: if effects.is_empty() {
+                    effect_mask::NONE
+                } else {
+                    effect_mask::IO
+                },
             };
             let outcome = word::store_word(&conn, &word)?;
             if !no_register {
@@ -770,20 +772,6 @@ fn require_store_path(path: Option<&Path>) -> Result<&Path> {
     }
 }
 
-fn parse_attrs(entries: &[String]) -> Result<Vec<(String, String)>> {
-    let mut pairs = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let Some((key, value)) = entry.split_once('=') else {
-            bail!("invalid attr `{entry}`; expected key=value");
-        };
-        if key.is_empty() {
-            bail!("attribute key cannot be empty in `{entry}`");
-        }
-        pairs.push((key.to_string(), value.to_string()));
-    }
-    Ok(pairs)
-}
-
 /// Convert CLI type atoms into `TypeTag`s.
 fn parse_type_tags(entries: &[String]) -> Result<Vec<TypeTag>> {
     entries.iter().map(|s| TypeTag::from_atom(s)).collect()
@@ -954,7 +942,8 @@ fn parse_type_list(spec: &str) -> Result<Vec<String>> {
 }
 
 fn cbor_to_pretty_json(bytes: &[u8]) -> Result<String> {
-    let value: serde_cbor::Value = serde_cbor::from_slice(bytes)?;
+    let mut deserializer = serde_cbor::Deserializer::from_slice(bytes);
+    let value = serde_cbor::Value::deserialize(&mut deserializer)?;
     let json = serde_json::to_string_pretty(&value)?;
     Ok(json)
 }
@@ -1035,7 +1024,6 @@ mod cli_tests {
                 name: "demo/add".to_string(),
                 params: vec!["i64".to_string(), "i64".to_string()],
                 results: vec!["i64".to_string()],
-                attrs: vec![],
                 effects: vec![],
                 no_register: false,
             },
@@ -1046,21 +1034,13 @@ mod cli_tests {
         let (kind, cbor) = load_object_cbor(&conn, &cid)?;
         assert_eq!(kind, "prim");
 
-        let mut prim_kind = None;
-        if let Value::Map(entries) = serde_cbor::from_slice::<Value>(&cbor)? {
-            for (key, value) in entries {
-                if let Value::Text(k) = key {
-                    if k == "kind" {
-                        if let Value::Text(v) = value {
-                            prim_kind = Some(v);
-                        }
-                    }
-                }
-            }
-        } else {
-            panic!("primitive CBOR must be a map");
-        }
-        assert_eq!(prim_kind.as_deref(), Some("prim"));
+        let value = serde_cbor::from_slice::<Value>(&cbor)?;
+        let array = match value {
+            Value::Array(items) => items,
+            _ => panic!("primitive CBOR must be array"),
+        };
+        assert_eq!(array.len(), 5);
+        assert_eq!(array[0], Value::Integer(0));
         Ok(())
     }
 
@@ -1083,35 +1063,8 @@ mod cli_tests {
         let cid = get_name(&conn, "iface", "demo.iface/math")?.expect("name registered");
         let (_, cbor) = load_object_cbor(&conn, &cid)?;
 
-        let value: Value = serde_cbor::from_slice(&cbor)?;
-        let mut found_exports = Vec::new();
-        if let Value::Map(entries) = value {
-            for (key, val) in entries {
-                if let Value::Text(k) = key {
-                    if k == "names" {
-                        if let Value::Array(symbols) = val {
-                            for symbol in symbols {
-                                if let Value::Map(sym_entries) = symbol {
-                                    for (sym_key, sym_val) in sym_entries {
-                                        if let Value::Text(sym_key_name) = sym_key {
-                                            if sym_key_name == "name" {
-                                                if let Value::Text(sym_name) = sym_val {
-                                                    found_exports.push(sym_name);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            panic!("interface CBOR must be a map");
-        }
-
-        assert_eq!(found_exports, vec!["hello".to_string()]);
+        let hello_found = cbor.windows(b"hello".len()).any(|w| w == b"hello");
+        assert!(hello_found);
         Ok(())
     }
 }

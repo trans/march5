@@ -1,12 +1,12 @@
 //! Canonical encoding and persistence for word entrypoints.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
 
-use crate::cbor::{push_bytes, push_map, push_text};
-use crate::types::{TypeTag, encode_type_signature};
+use crate::cbor::{push_array, push_bytes, push_text};
+use crate::types::{EffectMask, TypeTag, effect_mask};
 use crate::{cid, store};
 
 /// Structured word definition before encoding.
@@ -16,6 +16,7 @@ pub struct WordCanon {
     pub params: Vec<String>,
     pub results: Vec<String>,
     pub effects: Vec<[u8; 32]>,
+    pub effect_mask: EffectMask,
 }
 
 /// Result of persisting a word object.
@@ -27,29 +28,25 @@ pub struct WordStoreOutcome {
 /// Encode a word into canonical CBOR.
 pub fn encode(word: &WordCanon) -> Vec<u8> {
     let mut buf = Vec::new();
-    let has_effects = !word.effects.is_empty();
-    let map_len = if has_effects { 4 } else { 3 };
-    push_map(&mut buf, map_len);
-
-    push_text(&mut buf, "kind");
-    push_text(&mut buf, "word");
-
-    push_text(&mut buf, "root");
+    push_array(&mut buf, 5);
+    crate::cbor::push_u32(&mut buf, 1); // object tag for "word"
     push_bytes(&mut buf, &word.root);
 
-    push_text(&mut buf, "type");
-    let param_refs: Vec<&str> = word.params.iter().map(|s| s.as_str()).collect();
-    let result_refs: Vec<&str> = word.results.iter().map(|s| s.as_str()).collect();
-    encode_type_signature(&mut buf, &param_refs, &result_refs);
+    push_array(&mut buf, word.params.len() as u64);
+    for param in &word.params {
+        push_text(&mut buf, param);
+    }
 
-    if has_effects {
-        push_text(&mut buf, "effects");
-        let mut sorted = word.effects.clone();
-        sorted.sort();
-        crate::cbor::push_array(&mut buf, sorted.len() as u64);
-        for effect in sorted {
-            crate::cbor::push_bytes(&mut buf, &effect);
-        }
+    push_array(&mut buf, word.results.len() as u64);
+    for result in &word.results {
+        push_text(&mut buf, result);
+    }
+
+    let mut sorted_effects = word.effects.clone();
+    sorted_effects.sort();
+    push_array(&mut buf, sorted_effects.len() as u64);
+    for effect in sorted_effects {
+        push_bytes(&mut buf, &effect);
     }
 
     buf
@@ -70,6 +67,7 @@ pub struct WordInfo {
     pub params: Vec<TypeTag>,
     pub results: Vec<TypeTag>,
     pub effects: Vec<[u8; 32]>,
+    pub effect_mask: EffectMask,
 }
 
 /// Load word metadata from storage.
@@ -79,29 +77,21 @@ pub fn load_word_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<WordInf
         [cid_bytes.as_slice()],
         |row| row.get(0),
     )?;
-    let record: WordRecord = serde_cbor::from_slice(&cbor)?;
-    if record.kind != "word" {
-        return Err(anyhow!(
-            "object kind mismatch while loading word: {}",
-            record.kind
-        ));
+    let WordRecord(tag, root_buf, params_raw, results_raw, effects_raw) =
+        serde_cbor::from_slice(&cbor)?;
+    if tag != 1 {
+        bail!("object tag mismatch while loading word: {tag}");
     }
-    let root = bytebuf_to_array(&record.root)?;
-    let params = record
-        .ty
-        .params
+    let root = bytebuf_to_array(&root_buf)?;
+    let params = params_raw
         .iter()
         .map(|s| TypeTag::from_atom(s))
         .collect::<Result<Vec<_>>>()?;
-    let results = record
-        .ty
-        .results
+    let results = results_raw
         .iter()
         .map(|s| TypeTag::from_atom(s))
         .collect::<Result<Vec<_>>>()?;
-    let effects = record
-        .effects
-        .unwrap_or_default()
+    let effects = effects_raw
         .into_iter()
         .map(|bytes| {
             let slice = bytes.as_ref();
@@ -113,11 +103,17 @@ pub fn load_word_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<WordInf
             Ok(arr)
         })
         .collect::<Result<Vec<_>>>()?;
+    let effect_mask_value = if effects.is_empty() {
+        effect_mask::NONE
+    } else {
+        effect_mask::IO
+    };
     Ok(WordInfo {
         root,
         params,
         results,
         effects,
+        effect_mask: effect_mask_value,
     })
 }
 
@@ -132,25 +128,12 @@ fn bytebuf_to_array(buf: &ByteBuf) -> Result<[u8; 32]> {
 }
 
 #[derive(Deserialize)]
-struct WordRecord {
-    kind: String,
-    root: ByteBuf,
-    #[serde(rename = "type")]
-    ty: WordTypeRecord,
-    #[serde(default)]
-    effects: Option<Vec<ByteBuf>>,
-}
-
-#[derive(Deserialize)]
-struct WordTypeRecord {
-    params: Vec<String>,
-    results: Vec<String>,
-}
+struct WordRecord(u64, ByteBuf, Vec<String>, Vec<String>, Vec<ByteBuf>);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TypeTag;
+    use crate::types::{TypeTag, effect_mask};
 
     #[test]
     fn encode_word_empty_type() {
@@ -159,11 +142,19 @@ mod tests {
             params: Vec::new(),
             results: vec!["i64".to_string()],
             effects: Vec::new(),
+            effect_mask: effect_mask::NONE,
         };
         let encoded = encode(&word);
-        // Ensure the kind and root fields are present.
-        assert!(encoded.windows(4).any(|w| w == b"word"));
-        assert!(encoded.iter().filter(|&&b| b == 0x11).count() >= 32);
+        let value: serde_cbor::Value =
+            serde_cbor::from_slice(&encoded).expect("valid CBOR encoding");
+        match value {
+            serde_cbor::Value::Array(items) => {
+                assert_eq!(items.len(), 5);
+                assert_eq!(items[0], serde_cbor::Value::Integer(1));
+                assert!(matches!(items[1], serde_cbor::Value::Bytes(_)));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
     }
 
     #[test]
@@ -176,6 +167,7 @@ mod tests {
             params: vec!["i64".to_string()],
             results: vec!["i64".to_string()],
             effects: vec![[0xAA; 32]],
+            effect_mask: effect_mask::IO,
         };
         let outcome = store_word(&conn, &word)?;
         let info = load_word_info(&conn, &outcome.cid)?;
@@ -184,6 +176,7 @@ mod tests {
         assert_eq!(info.results, vec![TypeTag::I64]);
         assert_eq!(info.effects.len(), 1);
         assert_eq!(info.effects[0], [0xAA; 32]);
+        assert_eq!(info.effect_mask, effect_mask::IO);
         Ok(())
     }
 }

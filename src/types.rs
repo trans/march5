@@ -6,6 +6,24 @@ use anyhow::{Result, bail};
 
 use crate::cbor::{push_array, push_map, push_text};
 
+pub type EffectMask = u32;
+
+pub mod effect_mask {
+    use super::EffectMask;
+
+    pub const NONE: EffectMask = 0;
+    pub const IO: EffectMask = 1 << 0;
+    pub const STATE_READ: EffectMask = 1 << 1;
+    pub const STATE_WRITE: EffectMask = 1 << 2;
+    pub const TEST: EffectMask = 1 << 3;
+    pub const METRIC: EffectMask = 1 << 4;
+}
+
+#[inline]
+pub fn mask_has(mask: EffectMask, flag: EffectMask) -> bool {
+    (mask & flag) != 0
+}
+
 /// Compact representation of common Mini-INet type atoms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TypeTag {
@@ -14,6 +32,8 @@ pub enum TypeTag {
     Ptr,
     Unit,
     Token,
+    StateToken,
+    IoToken,
 }
 
 impl TypeTag {
@@ -25,6 +45,8 @@ impl TypeTag {
             TypeTag::Ptr => "ptr",
             TypeTag::Unit => "unit",
             TypeTag::Token => "token",
+            TypeTag::StateToken => "state.token",
+            TypeTag::IoToken => "io.token",
         }
     }
 
@@ -36,6 +58,8 @@ impl TypeTag {
             "ptr" => Ok(TypeTag::Ptr),
             "unit" => Ok(TypeTag::Unit),
             "token" => Ok(TypeTag::Token),
+            "state.token" => Ok(TypeTag::StateToken),
+            "io.token" => Ok(TypeTag::IoToken),
             other => bail!("unknown type atom `{other}`"),
         }
     }

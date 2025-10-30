@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use anyhow::{Result, bail};
 use rusqlite::Connection;
 
-use crate::cbor::{push_array, push_bytes, push_i64, push_map, push_text, push_u32};
+use crate::cbor::{push_array, push_bytes, push_i64, push_text, push_u32};
 use crate::{cid, store};
 
 /// Reference to another node's output.
@@ -88,82 +88,13 @@ pub fn encode(node: &NodeCanon) -> Result<Vec<u8>> {
     validate_node(node)?;
 
     let mut buf = Vec::new();
-    let mut key_count = 2; // kind, nk
-    // TODO: remove legacy `ty` emission once RETURN nodes are fully adopted.
-    if node.ty.is_some() {
-        key_count += 1;
-    }
-    if !node.out.is_empty() || node.kind == NodeKind::Return || node.ty.is_none() {
-        key_count += 1;
-    }
-    match node.kind {
-        NodeKind::Return => {
-            key_count += 2; // vals, deps
-        }
-        _ => {
-            key_count += 1; // in
-        }
-    }
-    if !node.effects.is_empty() {
-        key_count += 1;
-    }
-    key_count += 1; // pl
-    push_map(&mut buf, key_count);
-
-    push_text(&mut buf, "kind");
-    push_text(&mut buf, "node");
-
-    push_text(&mut buf, "nk");
-    push_text(
-        &mut buf,
-        match node.kind {
-            NodeKind::Lit => "LIT",
-            NodeKind::Prim => "PRIM",
-            NodeKind::Call => "CALL",
-            NodeKind::Arg => "ARG",
-            NodeKind::LoadGlobal => "LOAD_GLOBAL",
-            NodeKind::Return => "RETURN",
-            NodeKind::Pair => "PAIR",
-            NodeKind::Unpair => "UNPAIR",
-            NodeKind::Quote => "QUOTE",
-            NodeKind::Apply => "APPLY",
-            NodeKind::If => "IF",
-            NodeKind::Token => "TOKEN",
-            NodeKind::Guard => "GUARD",
-            NodeKind::Deopt => "DEOPT",
-        },
-    );
-
-    if let Some(ty) = &node.ty {
-        push_text(&mut buf, "ty");
-        push_text(&mut buf, ty);
-    }
-
-    if !node.out.is_empty() || node.kind == NodeKind::Return || node.ty.is_none() {
-        push_text(&mut buf, "out");
-        encode_outputs(&mut buf, &node.out);
-    }
-
-    match node.kind {
-        NodeKind::Return => {
-            push_text(&mut buf, "vals");
-            encode_inputs_preserve(&mut buf, &node.vals);
-            push_text(&mut buf, "deps");
-            encode_inputs_sorted(&mut buf, &node.deps);
-        }
-        _ => {
-            push_text(&mut buf, "in");
-            encode_inputs_preserve(&mut buf, &node.inputs);
-        }
-    }
-
-    if !node.effects.is_empty() {
-        push_text(&mut buf, "eff");
-        encode_effects(&mut buf, &node.effects);
-    }
-
-    push_text(&mut buf, "pl");
-    encode_payload(&mut buf, &node.payload);
+    push_array(&mut buf, 6);
+    crate::cbor::push_u32(&mut buf, 6); // object tag for "node"
+    crate::cbor::push_u32(&mut buf, node_kind_tag(node.kind) as u32);
+    encode_inputs(&mut buf, &node.inputs);
+    encode_outputs(&mut buf, &node.out);
+    encode_effects(&mut buf, &node.effects);
+    encode_payload(&mut buf, node)?;
 
     Ok(buf)
 }
@@ -176,47 +107,60 @@ pub fn store_node(conn: &Connection, node: &NodeCanon) -> Result<NodeStoreOutcom
     Ok(NodeStoreOutcome { cid, inserted })
 }
 
+fn node_kind_tag(kind: NodeKind) -> u8 {
+    match kind {
+        NodeKind::Lit => 0,
+        NodeKind::Prim => 1,
+        NodeKind::Call => 2,
+        NodeKind::Arg => 3,
+        NodeKind::LoadGlobal => 4,
+        NodeKind::Return => 5,
+        NodeKind::Pair => 6,
+        NodeKind::Unpair => 7,
+        NodeKind::Quote => 8,
+        NodeKind::Apply => 9,
+        NodeKind::If => 10,
+        NodeKind::Token => 11,
+        NodeKind::Guard => 12,
+        NodeKind::Deopt => 13,
+    }
+}
+
+fn encode_inputs(buf: &mut Vec<u8>, inputs: &[NodeInput]) {
+    push_array(buf, inputs.len() as u64);
+    for input in inputs {
+        encode_input(buf, input);
+    }
+}
+
+fn encode_input(buf: &mut Vec<u8>, input: &NodeInput) {
+    push_array(buf, 2);
+    push_bytes(buf, &input.cid);
+    push_u32(buf, input.port);
+}
+
+fn encode_input_list(buf: &mut Vec<u8>, inputs: &[NodeInput]) {
+    push_array(buf, inputs.len() as u64);
+    for input in inputs {
+        encode_input(buf, input);
+    }
+}
+
+fn encode_input_list_sorted(buf: &mut Vec<u8>, inputs: &[NodeInput]) {
+    let mut sorted = inputs.to_vec();
+    sorted.sort_by(|a, b| match a.cid.cmp(&b.cid) {
+        Ordering::Equal => a.port.cmp(&b.port),
+        other => other,
+    });
+    sorted.dedup_by(|a, b| a.cid == b.cid && a.port == b.port);
+    encode_input_list(buf, &sorted);
+}
+
 fn encode_outputs(buf: &mut Vec<u8>, outs: &[String]) {
     push_array(buf, outs.len() as u64);
     for out in outs {
         push_text(buf, out);
     }
-}
-
-fn encode_inputs_sorted(buf: &mut Vec<u8>, inputs: &[NodeInput]) {
-    let mut sorted = inputs.to_vec();
-    sorted.sort_by(|a, b| match a.port.cmp(&b.port) {
-        Ordering::Equal => a.cid.cmp(&b.cid),
-        other => other,
-    });
-
-    push_array(buf, sorted.len() as u64);
-    for input in sorted {
-        push_map(buf, 2);
-        push_text(buf, "cid");
-        push_bytes(buf, &input.cid);
-        push_text(buf, "port");
-        push_u32(buf, input.port);
-    }
-}
-
-fn encode_inputs_preserve(buf: &mut Vec<u8>, inputs: &[NodeInput]) {
-    push_array(buf, inputs.len() as u64);
-    for input in inputs {
-        push_map(buf, 2);
-        push_text(buf, "cid");
-        push_bytes(buf, &input.cid);
-        push_text(buf, "port");
-        push_u32(buf, input.port);
-    }
-}
-
-fn encode_single_input(buf: &mut Vec<u8>, input: &NodeInput) {
-    push_map(buf, 2);
-    push_text(buf, "cid");
-    push_bytes(buf, &input.cid);
-    push_text(buf, "port");
-    push_u32(buf, input.port);
 }
 
 fn encode_effects(buf: &mut Vec<u8>, effects: &[[u8; 32]]) {
@@ -228,97 +172,100 @@ fn encode_effects(buf: &mut Vec<u8>, effects: &[[u8; 32]]) {
     }
 }
 
-fn encode_payload(buf: &mut Vec<u8>, payload: &NodePayload) {
-    match payload {
-        NodePayload::Return => {
-            push_map(buf, 0);
-            return;
+fn encode_payload(buf: &mut Vec<u8>, node: &NodeCanon) -> Result<()> {
+    match node.kind {
+        NodeKind::Return => {
+            push_array(buf, 2);
+            encode_input_list(buf, &node.vals);
+            encode_input_list_sorted(buf, &node.deps);
+            return Ok(());
         }
-        NodePayload::Apply { qid, type_key } => {
-            let mut map_len = 1;
-            if type_key.is_some() {
-                map_len += 1;
+        NodeKind::Lit => match node.payload {
+            NodePayload::LitI64(value) => {
+                push_i64(buf, value);
+                return Ok(());
             }
-            push_map(buf, map_len);
-            push_text(buf, "qid");
-            push_bytes(buf, qid);
-            if let Some(key) = type_key {
-                push_text(buf, "type_key");
-                push_bytes(buf, key);
+            _ => bail!("LIT node requires literal payload"),
+        },
+        NodeKind::Prim => match node.payload {
+            NodePayload::Prim(cid) => {
+                push_bytes(buf, &cid);
+                return Ok(());
             }
-            return;
+            _ => bail!("PRIM node requires prim payload"),
+        },
+        NodeKind::Call => match node.payload {
+            NodePayload::Word(cid) => {
+                push_bytes(buf, &cid);
+                return Ok(());
+            }
+            _ => bail!("CALL node requires word payload"),
+        },
+        NodeKind::Arg => match node.payload {
+            NodePayload::Arg(index) => {
+                push_u32(buf, index);
+                return Ok(());
+            }
+            _ => bail!("ARG node requires index payload"),
+        },
+        NodeKind::LoadGlobal => match node.payload {
+            NodePayload::Global(cid) => {
+                push_bytes(buf, &cid);
+                return Ok(());
+            }
+            _ => bail!("LOAD_GLOBAL node requires global payload"),
+        },
+        NodeKind::Pair | NodeKind::Unpair | NodeKind::Token | NodeKind::Deopt => {
+            push_array(buf, 0);
+            return Ok(());
         }
-        NodePayload::If {
-            true_cont,
-            false_cont,
-        } => {
-            push_map(buf, 2);
-            push_text(buf, "true");
-            encode_single_input(buf, true_cont);
-            push_text(buf, "false");
-            encode_single_input(buf, false_cont);
-            return;
-        }
-        NodePayload::Token => {
-            push_map(buf, 0);
-            return;
-        }
-        NodePayload::Guard {
-            type_key,
-            match_cont,
-            else_cont,
-        } => {
-            push_map(buf, 3);
-            push_text(buf, "guard_type");
-            push_bytes(buf, type_key);
-            push_text(buf, "match");
-            encode_single_input(buf, match_cont);
-            push_text(buf, "else");
-            encode_single_input(buf, else_cont);
-            return;
-        }
-        NodePayload::Deopt => {
-            push_map(buf, 0);
-            return;
-        }
-        NodePayload::Empty => {
-            push_map(buf, 0);
-            return;
-        }
-        _ => push_map(buf, 1),
-    }
-    match payload {
-        NodePayload::LitI64(value) => {
-            push_text(buf, "lit");
-            push_i64(buf, *value);
-        }
-        NodePayload::Prim(cid) => {
-            push_text(buf, "prim");
-            push_bytes(buf, cid);
-        }
-        NodePayload::Word(cid) => {
-            push_text(buf, "word");
-            push_bytes(buf, cid);
-        }
-        NodePayload::Arg(index) => {
-            push_text(buf, "arg");
-            push_u32(buf, *index);
-        }
-        NodePayload::Global(cid) => {
-            push_text(buf, "glob");
-            push_bytes(buf, cid);
-        }
-        NodePayload::Return => {}
-        NodePayload::Quote(cid) => {
-            push_text(buf, "quote");
-            push_bytes(buf, cid);
-        }
-        NodePayload::Apply { .. } => unreachable!(),
-        NodePayload::If { .. } => unreachable!(),
-        NodePayload::Token => unreachable!(),
-        NodePayload::Guard { .. } => unreachable!(),
-        NodePayload::Deopt => unreachable!(),
-        NodePayload::Empty => unreachable!(),
+        NodeKind::Quote => match node.payload {
+            NodePayload::Quote(cid) => {
+                push_bytes(buf, &cid);
+                return Ok(());
+            }
+            _ => bail!("QUOTE node requires quote payload"),
+        },
+        NodeKind::Apply => match node.payload {
+            NodePayload::Apply { qid, type_key } => {
+                if let Some(key) = type_key {
+                    push_array(buf, 2);
+                    push_bytes(buf, &qid);
+                    push_bytes(buf, &key);
+                } else {
+                    push_array(buf, 1);
+                    push_bytes(buf, &qid);
+                }
+                return Ok(());
+            }
+            _ => bail!("APPLY node requires apply payload"),
+        },
+        NodeKind::If => match node.payload {
+            NodePayload::If {
+                ref true_cont,
+                ref false_cont,
+            } => {
+                push_array(buf, 2);
+                encode_input(buf, true_cont);
+                encode_input(buf, false_cont);
+                return Ok(());
+            }
+            _ => bail!("IF node requires branch payload"),
+        },
+        NodeKind::Guard => match node.payload {
+            NodePayload::Guard {
+                type_key,
+                ref match_cont,
+                ref else_cont,
+            } => {
+                push_array(buf, 3);
+                push_bytes(buf, &type_key);
+                encode_input(buf, match_cont);
+                encode_input(buf, else_cont);
+                return Ok(());
+            }
+            _ => bail!("GUARD node requires guard payload"),
+        },
     }
 }
 
@@ -419,6 +366,13 @@ mod tests {
     use crate::types::TypeTag;
     use serde_cbor::Value;
 
+    fn decode(encoded: &[u8]) -> Vec<Value> {
+        match serde_cbor::from_slice::<Value>(encoded).expect("valid CBOR encoding") {
+            Value::Array(items) => items,
+            other => panic!("expected node to encode as array, got {other:?}"),
+        }
+    }
+
     #[test]
     fn encode_lit_node() {
         let node = NodeCanon {
@@ -431,26 +385,13 @@ mod tests {
             effects: Vec::new(),
             payload: NodePayload::LitI64(9),
         };
-        let encoded = encode(&node).unwrap();
-        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
-        let map = match value {
-            Value::Map(entries) => entries,
-            _ => panic!("node should encode as map"),
-        };
-        let mut fields = std::collections::BTreeMap::new();
-        for (k, v) in map {
-            if let Value::Text(key) = k {
-                fields.insert(key, v);
-            }
-        }
-        assert_eq!(fields.get("nk"), Some(&Value::Text("LIT".to_string())));
-        assert_eq!(fields.get("ty"), Some(&Value::Text("i64".to_string())));
-        assert_eq!(
-            fields.get("out"),
-            Some(&Value::Array(vec![Value::Text("i64".to_string())]))
-        );
-        assert_eq!(fields.get("in"), Some(&Value::Array(Vec::new())));
-        assert!(fields.contains_key("pl"));
+        let items = decode(&encode(&node).unwrap());
+        assert_eq!(items[0], Value::Integer(6));
+        assert_eq!(items[1], Value::Integer(0));
+        assert_eq!(items[2], Value::Array(Vec::new()));
+        assert_eq!(items[3], Value::Array(vec![Value::Text("i64".to_string())]));
+        assert_eq!(items[4], Value::Array(Vec::new()));
+        assert_eq!(items[5], Value::Integer(9));
     }
 
     #[test]
@@ -474,58 +415,26 @@ mod tests {
             effects: vec![[0xAA; 32]],
             payload: NodePayload::Prim([0xFF; 32]),
         };
-        let encoded = encode(&node).unwrap();
-        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
-        let map = match value {
-            Value::Map(entries) => entries,
-            _ => panic!("node should encode as map"),
-        };
-        let mut fields = std::collections::BTreeMap::new();
-        for (k, v) in map {
-            if let Value::Text(key) = k {
-                fields.insert(key, v);
-            }
-        }
-        let inputs = match fields.get("in").unwrap() {
+        let items = decode(&encode(&node).unwrap());
+        assert_eq!(items[1], Value::Integer(1));
+        let inputs = match &items[2] {
             Value::Array(values) => values,
-            _ => panic!("inputs should be array"),
+            other => panic!("inputs should be array, got {other:?}"),
         };
+        assert_eq!(inputs.len(), 2);
         let ports: Vec<u32> = inputs
             .iter()
             .map(|entry| match entry {
-                Value::Map(m) => m
-                    .iter()
-                    .find_map(|(k, v)| {
-                        if let (Value::Text(key), Value::Integer(port)) = (k, v) {
-                            if key == "port" {
-                                Some(*port as u32)
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    })
-                    .expect("port field present"),
-                _ => panic!("input entry must be map"),
+                Value::Array(elements) if elements.len() == 2 => match &elements[1] {
+                    Value::Integer(port) => *port as u32,
+                    other => panic!("expected port integer, got {other:?}"),
+                },
+                other => panic!("input entry must be array, got {other:?}"),
             })
             .collect();
         assert_eq!(ports, vec![1, 0]);
-        assert_eq!(
-            fields.get("out"),
-            Some(&Value::Array(vec![Value::Text("i64".to_string())]))
-        );
-        // Effects array should contain the expected CID bytes.
-        let effects = match fields.get("eff").unwrap() {
-            Value::Array(values) => values,
-            _ => panic!("effects should be array"),
-        };
-        assert_eq!(effects.len(), 1);
-        let effect_bytes = match &effects[0] {
-            Value::Bytes(bytes) => bytes,
-            _ => panic!("effect entry should be bytes"),
-        };
-        assert_eq!(effect_bytes.len(), 32);
+        assert!(matches!(items[4], Value::Array(ref v) if v.len() == 1));
+        assert!(matches!(items[5], Value::Bytes(_)));
     }
 
     #[test]
@@ -540,36 +449,13 @@ mod tests {
             effects: Vec::new(),
             payload: NodePayload::Quote([0x42; 32]),
         };
-        let encoded = encode(&node).unwrap();
-        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
-        let entries = match value {
-            Value::Map(entries) => entries,
-            _ => panic!("quote node should encode to map"),
-        };
-        let mut map = std::collections::BTreeMap::new();
-        for (k, v) in entries {
-            if let Value::Text(key) = k {
-                map.insert(key, v);
-            }
+        let items = decode(&encode(&node).unwrap());
+        assert_eq!(items[1], Value::Integer(8));
+        assert_eq!(items[3], Value::Array(vec![Value::Text("ptr".to_string())]));
+        match &items[5] {
+            Value::Bytes(bytes) => assert_eq!(bytes.len(), 32),
+            other => panic!("payload must be bytes, got {other:?}"),
         }
-        assert_eq!(map.get("nk"), Some(&Value::Text("QUOTE".to_string())));
-        assert_eq!(
-            map.get("out"),
-            Some(&Value::Array(vec![Value::Text("ptr".to_string())]))
-        );
-        let payload = map.get("pl").expect("payload present");
-        let payload_map = match payload {
-            Value::Map(entries) => entries,
-            _ => panic!("payload must be map"),
-        };
-        let quote_bytes = payload_map
-            .iter()
-            .find_map(|(k, v)| match (k, v) {
-                (Value::Text(key), Value::Bytes(bytes)) if key == "quote" => Some(bytes.clone()),
-                _ => None,
-            })
-            .expect("quote bytes present");
-        assert_eq!(quote_bytes.len(), 32);
     }
 
     #[test]
@@ -596,39 +482,27 @@ mod tests {
                 },
             },
         };
-        let encoded = encode(&node).unwrap();
-        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
-        let map = match value {
-            Value::Map(entries) => entries,
-            _ => panic!("IF node should encode as map"),
-        };
-        let mut fields = std::collections::BTreeMap::new();
-        for (k, v) in map {
-            if let Value::Text(key) = k {
-                fields.insert(key, v);
-            }
+        let items = decode(&encode(&node).unwrap());
+        assert_eq!(items[1], Value::Integer(10));
+        match &items[2] {
+            Value::Array(values) => assert_eq!(values.len(), 1),
+            other => panic!("inputs should be array, got {other:?}"),
         }
-        assert_eq!(fields.get("nk"), Some(&Value::Text("IF".to_string())));
-        let inputs = match fields.get("in").expect("inputs present") {
-            Value::Array(values) => values,
-            _ => panic!("inputs should be array"),
-        };
-        assert_eq!(inputs.len(), 1);
-        let payload = fields.get("pl").expect("payload present");
-        let payload_map = match payload {
-            Value::Map(entries) => entries,
-            _ => panic!("payload must be map"),
-        };
-        assert!(
-            payload_map
-                .iter()
-                .any(|(k, _)| matches!(k, Value::Text(s) if s == "true"))
-        );
-        assert!(
-            payload_map
-                .iter()
-                .any(|(k, _)| matches!(k, Value::Text(s) if s == "false"))
-        );
+        match &items[5] {
+            Value::Array(values) => {
+                assert_eq!(values.len(), 2);
+                for entry in values {
+                    match entry {
+                        Value::Array(parts) if parts.len() == 2 => {
+                            assert!(matches!(parts[0], Value::Bytes(_)));
+                            assert!(matches!(parts[1], Value::Integer(_)));
+                        }
+                        other => panic!("unexpected IF payload entry: {other:?}"),
+                    }
+                }
+            }
+            other => panic!("payload must be array, got {other:?}"),
+        }
     }
 
     #[test]
@@ -643,23 +517,9 @@ mod tests {
             effects: Vec::new(),
             payload: NodePayload::Token,
         };
-        let encoded = encode(&node).unwrap();
-        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
-        let map = match value {
-            Value::Map(entries) => entries,
-            _ => panic!("TOKEN node should encode as map"),
-        };
-        let mut fields = std::collections::BTreeMap::new();
-        for (k, v) in map {
-            if let Value::Text(key) = k {
-                fields.insert(key, v);
-            }
-        }
-        assert_eq!(fields.get("nk"), Some(&Value::Text("TOKEN".to_string())));
-        assert_eq!(
-            fields.get("out"),
-            Some(&Value::Array(vec![Value::Text("ptr".to_string())]))
-        );
+        let items = decode(&encode(&node).unwrap());
+        assert_eq!(items[1], Value::Integer(11));
+        assert!(matches!(items[5], Value::Array(ref arr) if arr.is_empty()));
     }
 
     #[test]
@@ -688,39 +548,15 @@ mod tests {
                 },
             },
         };
-        let encoded = encode(&node).unwrap();
-        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
-        let map = match value {
-            Value::Map(entries) => entries,
-            _ => panic!("GUARD node should encode as map"),
-        };
-        let mut fields = std::collections::BTreeMap::new();
-        for (k, v) in map {
-            if let Value::Text(key) = k {
-                fields.insert(key, v);
+        let items = decode(&encode(&node).unwrap());
+        assert_eq!(items[1], Value::Integer(12));
+        match &items[5] {
+            Value::Array(values) => {
+                assert_eq!(values.len(), 3);
+                assert!(matches!(values[0], Value::Bytes(ref bytes) if bytes.len() == 32));
             }
+            other => panic!("payload must be array, got {other:?}"),
         }
-        assert_eq!(fields.get("nk"), Some(&Value::Text("GUARD".to_string())));
-        let payload = fields.get("pl").expect("payload present");
-        let payload_map = match payload {
-            Value::Map(entries) => entries,
-            _ => panic!("payload must be map"),
-        };
-        assert!(
-            payload_map
-                .iter()
-                .any(|(k, _)| matches!(k, Value::Text(s) if s == "guard_type"))
-        );
-        assert!(
-            payload_map
-                .iter()
-                .any(|(k, _)| matches!(k, Value::Text(s) if s == "match"))
-        );
-        assert!(
-            payload_map
-                .iter()
-                .any(|(k, _)| matches!(k, Value::Text(s) if s == "else"))
-        );
     }
 
     #[test]
@@ -735,19 +571,9 @@ mod tests {
             effects: Vec::new(),
             payload: NodePayload::Deopt,
         };
-        let encoded = encode(&node).unwrap();
-        let value: Value = serde_cbor::from_slice(&encoded).unwrap();
-        let map = match value {
-            Value::Map(entries) => entries,
-            _ => panic!("DEOPT node should encode as map"),
-        };
-        let mut fields = std::collections::BTreeMap::new();
-        for (k, v) in map {
-            if let Value::Text(key) = k {
-                fields.insert(key, v);
-            }
-        }
-        assert_eq!(fields.get("nk"), Some(&Value::Text("DEOPT".to_string())));
+        let items = decode(&encode(&node).unwrap());
+        assert_eq!(items[1], Value::Integer(13));
+        assert!(matches!(items[5], Value::Array(ref arr) if arr.is_empty()));
     }
 
     fn guard_key(tag: TypeTag) -> [u8; 32] {
