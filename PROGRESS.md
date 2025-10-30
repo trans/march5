@@ -17,7 +17,7 @@
 - Effect masks collapse to `effect_mask::IO`; other bit flags exist in `src/types.rs` but have no integration.
 - Namespace imports encode raw interface CIDs but do not retain alias metadata (`use` sugar) as noted in DESIGN-II (expected, but flag for future ergonomic layers).
 - Context dispatch, transactions, durability policies, and token pools described in DESIGN-IV/V remain to be prototyped beyond placeholder node kinds.
-- Canonical encoders still emit legacy `ty` fields for some nodes (see TODO in `src/node.rs`) pending full multi-output migration.
+- `RETURN`/multi-output encoding is in place; legacy `ty` fields have been removed.
 
 ## Artifacts & Data
 - Example database at `examples/helloworld.march5.db` demonstrates the CLI flow.

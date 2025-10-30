@@ -2,8 +2,6 @@
 
 ## Now (unblock drift from design docs)
 
-- **Normalize node/word effect metadata**: finish removing the legacy `ty` field for multi-output nodes, and ensure `WordCanon.effect_mask` is derived from declared effects instead of defaulting to IO.
-
 - **Document current CLI contracts**: capture argument formats for `iface add`, `namespace add`, and token-handling expectations in `README.md` to prevent misuse while encoders are in flux.
 
 ## Next (extend capability model)

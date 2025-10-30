@@ -113,7 +113,6 @@ impl<'conn> GraphBuilder<'conn> {
 
         let node = NodeCanon {
             kind: NodeKind::If,
-            ty: None,
             out: Vec::new(),
             inputs: vec![NodeInput {
                 cid: cond.cid,
@@ -142,7 +141,6 @@ impl<'conn> GraphBuilder<'conn> {
         for (idx, ty) in params.iter().enumerate() {
             let node = NodeCanon {
                 kind: NodeKind::Arg,
-                ty: Some(ty.as_atom().to_string()),
                 out: vec![ty.as_atom().to_string()],
                 inputs: Vec::new(),
                 vals: Vec::new(),
@@ -170,7 +168,6 @@ impl<'conn> GraphBuilder<'conn> {
     pub fn push_lit_i64(&mut self, value: i64) -> Result<[u8; 32]> {
         let node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -200,7 +197,6 @@ impl<'conn> GraphBuilder<'conn> {
 
         let node = NodeCanon {
             kind: NodeKind::Pair,
-            ty: Some(TypeTag::Ptr.as_atom().to_string()),
             out: vec![TypeTag::Ptr.as_atom().to_string()],
             inputs: vec![
                 NodeInput {
@@ -235,7 +231,6 @@ impl<'conn> GraphBuilder<'conn> {
 
         let node = NodeCanon {
             kind: NodeKind::Unpair,
-            ty: None,
             out: vec![
                 left_ty.as_atom().to_string(),
                 right_ty.as_atom().to_string(),
@@ -267,7 +262,6 @@ impl<'conn> GraphBuilder<'conn> {
     pub fn quote(&mut self, qid: [u8; 32]) -> Result<[u8; 32]> {
         let node = NodeCanon {
             kind: NodeKind::Quote,
-            ty: Some(TypeTag::Ptr.as_atom().to_string()),
             out: vec![TypeTag::Ptr.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -430,15 +424,9 @@ impl<'conn> GraphBuilder<'conn> {
         if emits_token {
             out_atoms.insert(0, TypeTag::Token.as_atom().to_string());
         }
-        let ty_field = if out_atoms.len() == 1 {
-            Some(out_atoms[0].clone())
-        } else {
-            None
-        };
 
         let node = NodeCanon {
             kind,
-            ty: ty_field,
             out: out_atoms,
             inputs: inputs_vec,
             vals: Vec::new(),
@@ -605,7 +593,6 @@ impl<'conn> GraphBuilder<'conn> {
 
         let return_node = NodeCanon {
             kind: NodeKind::Return,
-            ty: None,
             out: return_out_types,
             inputs: Vec::new(),
             vals,
@@ -661,7 +648,6 @@ impl<'conn> GraphBuilder<'conn> {
         let token_ty = TypeTag::Token;
         let node = NodeCanon {
             kind: NodeKind::Token,
-            ty: Some(token_ty.as_atom().to_string()),
             out: vec![token_ty.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),

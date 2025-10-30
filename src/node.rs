@@ -68,7 +68,6 @@ pub enum NodeKind {
 #[derive(Clone, Debug)]
 pub struct NodeCanon {
     pub kind: NodeKind,
-    pub ty: Option<String>,
     pub out: Vec<String>,
     pub inputs: Vec<NodeInput>,
     pub vals: Vec<NodeInput>,
@@ -275,9 +274,6 @@ fn validate_node(node: &NodeCanon) -> Result<()> {
             if !matches!(node.payload, NodePayload::Return) {
                 bail!("RETURN node requires a return payload");
             }
-            if node.ty.is_some() {
-                bail!("RETURN node must not set `ty`");
-            }
             if !node.inputs.is_empty() {
                 bail!("RETURN node must not have regular inputs");
             }
@@ -298,11 +294,6 @@ fn validate_node(node: &NodeCanon) -> Result<()> {
             }
             if node.out.is_empty() {
                 bail!("non-RETURN node must declare at least one output type");
-            }
-            if let Some(ty) = &node.ty {
-                if node.out.len() == 1 && ty != &node.out[0] {
-                    bail!("node ty `{ty}` does not match out[0] `{}`", node.out[0]);
-                }
             }
         }
     }
@@ -377,7 +368,6 @@ mod tests {
     fn encode_lit_node() {
         let node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some("i64".to_string()),
             out: vec!["i64".to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -398,7 +388,6 @@ mod tests {
     fn encode_prim_node_with_inputs_and_effects() {
         let node = NodeCanon {
             kind: NodeKind::Prim,
-            ty: Some("i64".to_string()),
             out: vec!["i64".to_string()],
             inputs: vec![
                 NodeInput {
@@ -441,7 +430,6 @@ mod tests {
     fn encode_quote_node() {
         let node = NodeCanon {
             kind: NodeKind::Quote,
-            ty: None,
             out: vec!["ptr".to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -462,7 +450,6 @@ mod tests {
     fn encode_if_node() {
         let node = NodeCanon {
             kind: NodeKind::If,
-            ty: None,
             out: vec!["i64".to_string()],
             inputs: vec![NodeInput {
                 cid: [0xAA; 32],
@@ -509,7 +496,6 @@ mod tests {
     fn encode_token_node() {
         let node = NodeCanon {
             kind: NodeKind::Token,
-            ty: Some(TypeTag::Ptr.as_atom().to_string()),
             out: vec![TypeTag::Ptr.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -527,7 +513,6 @@ mod tests {
         let key = guard_key(TypeTag::I64);
         let node = NodeCanon {
             kind: NodeKind::Guard,
-            ty: None,
             out: vec!["i64".to_string()],
             inputs: vec![NodeInput {
                 cid: [0xAA; 32],
@@ -563,7 +548,6 @@ mod tests {
     fn encode_deopt_node() {
         let node = NodeCanon {
             kind: NodeKind::Deopt,
-            ty: None,
             out: vec!["unit".to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),

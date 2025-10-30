@@ -631,7 +631,6 @@ mod tests {
 
         let value_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -643,7 +642,6 @@ mod tests {
 
         let match_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -655,7 +653,6 @@ mod tests {
 
         let else_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -667,7 +664,6 @@ mod tests {
 
         let guard_node = NodeCanon {
             kind: NodeKind::Guard,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: vec![NodeInput {
                 cid: value_cid,
@@ -692,7 +688,6 @@ mod tests {
 
         let return_node = NodeCanon {
             kind: NodeKind::Return,
-            ty: None,
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: vec![NodeInput {
@@ -726,7 +721,6 @@ mod tests {
 
         let value_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -738,7 +732,6 @@ mod tests {
 
         let match_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -750,7 +743,6 @@ mod tests {
 
         let else_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -762,7 +754,6 @@ mod tests {
 
         let guard_node = NodeCanon {
             kind: NodeKind::Guard,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: vec![NodeInput {
                 cid: value_cid,
@@ -787,7 +778,6 @@ mod tests {
 
         let return_node = NodeCanon {
             kind: NodeKind::Return,
-            ty: None,
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: vec![NodeInput {
@@ -821,7 +811,6 @@ mod tests {
 
         let value_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -833,7 +822,6 @@ mod tests {
 
         let match_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -845,7 +833,6 @@ mod tests {
 
         let deopt_node = NodeCanon {
             kind: NodeKind::Deopt,
-            ty: None,
             out: vec![TypeTag::Unit.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -857,7 +844,6 @@ mod tests {
 
         let guard_node = NodeCanon {
             kind: NodeKind::Guard,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: vec![NodeInput {
                 cid: value_cid,
@@ -882,7 +868,6 @@ mod tests {
 
         let return_node = NodeCanon {
             kind: NodeKind::Return,
-            ty: None,
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: vec![NodeInput {
@@ -916,7 +901,6 @@ mod tests {
 
         let cond_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -928,7 +912,6 @@ mod tests {
 
         let true_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -940,7 +923,6 @@ mod tests {
 
         let false_node = NodeCanon {
             kind: NodeKind::Lit,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: Vec::new(),
@@ -952,7 +934,6 @@ mod tests {
 
         let if_node = NodeCanon {
             kind: NodeKind::If,
-            ty: Some(TypeTag::I64.as_atom().to_string()),
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: vec![NodeInput {
                 cid: cond_cid,
@@ -976,7 +957,6 @@ mod tests {
 
         let return_node = NodeCanon {
             kind: NodeKind::Return,
-            ty: None,
             out: vec![TypeTag::I64.as_atom().to_string()],
             inputs: Vec::new(),
             vals: vec![NodeInput {

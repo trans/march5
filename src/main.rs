@@ -465,7 +465,6 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::Lit,
-                ty: Some(ty.clone()),
                 out: vec![ty],
                 inputs: Vec::new(),
                 vals: Vec::new(),
@@ -486,7 +485,6 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::Prim,
-                ty: Some(ty.clone()),
                 out: vec![ty],
                 inputs,
                 vals: Vec::new(),
@@ -507,7 +505,6 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::Call,
-                ty: Some(ty.clone()),
                 out: vec![ty],
                 inputs,
                 vals: Vec::new(),
@@ -521,7 +518,6 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::Arg,
-                ty: Some(ty.clone()),
                 out: vec![ty],
                 inputs: Vec::new(),
                 vals: Vec::new(),
@@ -540,7 +536,6 @@ fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
             let effects = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
             let node = NodeCanon {
                 kind: NodeKind::LoadGlobal,
-                ty: Some(ty.clone()),
                 out: vec![ty],
                 inputs: Vec::new(),
                 vals: Vec::new(),

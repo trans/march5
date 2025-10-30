@@ -113,6 +113,52 @@ List the registered words under a namespace prefix:
 target/release/march5 --db demo.march5.db word list --prefix demo.math/
 ```
 
+## CLI reference
+
+The commands above are intentionally thin wrappers around the canonical encoders.
+The following notes capture the current contracts the CLI expects:
+
+- **Effect and CID arguments**  
+  Every `--effect` flag accepts a raw 32‑byte CID encoded as 64 hex digits.  
+  Repeating the flag appends additional effect CIDs.  
+  Inputs supplied via `--input` must be written as `CID:PORT`, where `CID` is a
+  64‑digit hex string and `PORT` is the producer’s output port number.
+
+- **`iface add`**  
+  Each `--name` entry must follow `name(param,...) -> result,... | effectCID,...`.  
+  Omit the trailing `| …` section for pure exports. Type atoms are strings for
+  now (e.g., `i64`, `unit`). `--register <scope/name>` records the resulting
+  interface CID in `name_index`; pass `--no-register` to skip this step.
+
+- **`namespace add`**  
+  `--import <ifaceCID>` may be repeated to declare the required interface CIDs.  
+  `--export name=<wordCID>` pairs expose word CIDs under sorted names.  
+  If `--iface` is omitted the CLI derives the interface automatically from the
+  supplied exports. Namespaces are registered via `--name` unless
+  `--no-register` is provided.
+
+- **`node` subcommands**  
+  - `node lit --ty <atom> --value <i64> [--effect <cid> ...]`  
+  - `node prim --ty <atom> --prim <cid> [--input <cid:port> ...] [--effect <cid> ...]`  
+  - `node call --ty <atom> --word <cid> [--input <cid:port> ...] [--effect <cid> ...]`  
+  - `node arg --ty <atom> --index <u32> [--effect <cid> ...]`  
+  - `node load-global --ty <atom> --global <cid> [--effect <cid> ...]`  
+  Token nodes (created implicitly by the builder) currently cover only the IO
+  domain; if you create effectful nodes manually you must supply any required
+  token producer as one of the inputs.
+
+- **`word add` / `prim add`**  
+  Parameters and results are passed left-to-right via repeated `--param` and
+  `--result` flags. Declared effects use the same `--effect` flags described
+  above. Supplying `--no-register` prevents the name from being inserted into
+  `name_index`.
+
+- **Builder IO token policy**  
+  The interactive builder (`march5 builder`) threads a single IO token
+  automatically. Additional effect domains are not yet modelled; effectful
+  operations outside IO should be considered experimental until the token pool
+  work lands.
+
 ## Development
 
 Run the unit test suite (build check):
