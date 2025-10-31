@@ -5,6 +5,7 @@ pub mod cbor;
 pub mod cid;
 pub mod effect;
 pub mod exec;
+pub mod global_store;
 pub mod iface;
 pub mod interp;
 pub mod namespace;
@@ -13,11 +14,13 @@ pub mod prim;
 pub mod store;
 pub mod types;
 pub mod word;
+pub mod yaml;
 
 pub type Result<T> = anyhow::Result<T>;
 
 pub use builder::GraphBuilder;
 pub use effect::{EffectCanon, EffectStoreOutcome};
+pub use global_store::{GlobalStore, GlobalStoreSnapshot, GlobalStoreStoreOutcome, load_snapshot, store_snapshot};
 pub use iface::{IfaceCanon, IfaceStoreOutcome, IfaceSymbol};
 pub use interp::{Value, run_word, run_word_i64};
 pub use namespace::{NamespaceCanon, NamespaceExport, NamespaceStoreOutcome};

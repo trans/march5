@@ -38,6 +38,12 @@ pub fn push_i64(buf: &mut Vec<u8>, value: i64) {
     }
 }
 
+/// Append an IEEE-754 f64 value.
+pub fn push_f64(buf: &mut Vec<u8>, value: f64) {
+    buf.push((7 << 5) | 27);
+    buf.extend_from_slice(&value.to_bits().to_be_bytes());
+}
+
 fn push_unsigned(buf: &mut Vec<u8>, value: u64) {
     push_header(buf, 0, value);
 }

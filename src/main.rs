@@ -15,6 +15,8 @@ use march5::{
     TypeTag, Value, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store,
     put_name, run_word,
 };
+use march5::global_store::{self, GlobalStoreSnapshot, store_snapshot};
+use march5::yaml::{self, CatalogItem, WordOp};
 use serde::Deserialize;
 
 #[derive(Parser)]
@@ -55,6 +57,11 @@ enum Command {
         #[command(subcommand)]
         command: NamespaceCommand,
     },
+    /// Inspect and manage the in-memory global state store
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
     /// Manage graph nodes
     Node {
         #[command(subcommand)]
@@ -70,9 +77,18 @@ enum Command {
     /// Execute a word and print its result
     Run {
         name: String,
-        /// Supply repeated --arg <i64> values for parameters
+        /// Supply repeated --arg <literal> values for parameters
         #[arg(long = "arg")]
-        args: Vec<i64>,
+        args: Vec<String>,
+        /// Provide arguments via YAML sequence (tags like !i64, !text, !tuple)
+        #[arg(long = "args-yaml", value_name = "PATH")]
+        args_yaml: Option<PathBuf>,
+    },
+    /// Apply a YAML catalog of effects/prims/words/snapshots
+    Catalog {
+        file: PathBuf,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 
@@ -162,6 +178,30 @@ enum NamespaceCommand {
     },
     /// Show canonical JSON for a namespace by name
     Show { name: String },
+}
+
+#[derive(Subcommand)]
+enum StateCommand {
+    /// Print the current in-memory snapshot of the global store
+    Snapshot,
+    /// Clear the in-memory global store
+    Reset,
+    /// Persist the current global store snapshot
+    Save {
+        /// Optional name to register in the global store namespace
+        #[arg(long = "name", value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Load a persisted snapshot into the in-memory global store
+    Load {
+        /// Snapshot name registered in the global store namespace
+        name: String,
+    },
+    /// List saved global store snapshots
+    List {
+        #[arg(long = "prefix")]
+        prefix: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -288,9 +328,15 @@ fn run() -> Result<()> {
             let store_path = require_store_path(cli.store.as_deref())?;
             cmd_builder(store_path)
         }
-        Command::Run { name, args } => {
+        Command::State { command } => {
+            cmd_state(cli.store.as_deref(), command)
+        }
+        Command::Run { name, args, args_yaml } => {
             let store_path = require_store_path(cli.store.as_deref())?;
-            cmd_run(store_path, &name, &args)
+            cmd_run(store_path, &name, &args, args_yaml.as_deref())
+        }
+        Command::Catalog { file, dry_run } => {
+            cmd_catalog(cli.store.as_deref(), &file, dry_run)
         }
     }
 }
@@ -463,6 +509,194 @@ fn cmd_namespace(store: &Path, command: NamespaceCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn cmd_state(store: Option<&Path>, command: StateCommand) -> Result<()> {
+    match command {
+        StateCommand::Snapshot => {
+            let snapshot = global_store::snapshot();
+            if snapshot.is_empty() {
+                println!("(empty)");
+            } else {
+                for (key, value) in snapshot.iter() {
+                    println!("{key} = {value}");
+                }
+            }
+        }
+        StateCommand::Reset => {
+            global_store::reset();
+            println!("global store cleared");
+        }
+        StateCommand::Save { name } => {
+            let store_path = require_store_path(store)?;
+            let conn = open_store(store_path)?;
+            let snapshot = global_store::snapshot();
+            let outcome = global_store::store_snapshot(&conn, &snapshot)?;
+            let cid_hex = cid::to_hex(&outcome.cid);
+            if let Some(name) = name {
+                put_name(&conn, "gstate", &name, &outcome.cid)?;
+                println!("stored global snapshot `{name}` with cid {cid_hex}");
+            } else {
+                println!("stored global snapshot with cid {cid_hex}");
+            }
+        }
+        StateCommand::Load { name } => {
+            let store_path = require_store_path(store)?;
+            let conn = open_store(store_path)?;
+            let cid = get_name(&conn, "gstate", &name)?
+                .ok_or_else(|| anyhow!("snapshot `{name}` not found"))?;
+            let snapshot = global_store::load_snapshot(&conn, &cid)?;
+            global_store::restore(snapshot);
+            println!("restored global snapshot `{name}`");
+        }
+        StateCommand::List { prefix } => {
+            let store_path = require_store_path(store)?;
+            let conn = open_store(store_path)?;
+            list_scope(&conn, "gstate", prefix.as_deref(), "no saved snapshots")?;
+        }
+    }
+    Ok(())
+}
+
+fn cmd_catalog(store: Option<&Path>, file: &Path, dry_run: bool) -> Result<()> {
+    let catalog = yaml::parse_catalog_from_file(file)?;
+    if dry_run {
+        for (namespace, entries) in &catalog {
+            for (symbol, item) in entries {
+                println!("[dry-run] {namespace}/{symbol}: {}", describe_catalog_item(item));
+            }
+        }
+        return Ok(());
+    }
+
+    let store_path = require_store_path(store)?;
+    let conn = open_store(store_path)?;
+    for (namespace, entries) in catalog {
+        for (symbol, item) in entries {
+            let full_name = format!("{namespace}/{symbol}");
+            match item {
+                CatalogItem::Effect { doc } => {
+                    let spec = EffectCanon {
+                        name: &full_name,
+                        doc: doc.as_deref(),
+                    };
+                    let outcome = effect::store_effect(&conn, &spec)?;
+                    put_name(&conn, "effect", &full_name, &outcome.cid)?;
+                    println!(
+                        "stored effect `{full_name}` with cid {}",
+                        cid::to_hex(&outcome.cid)
+                    );
+                }
+                CatalogItem::Prim {
+                    params,
+                    results,
+                    effects,
+                    emask,
+                } => {
+                    let effect_mask = parse_effect_mask_flags(&emask)?;
+                    let spec = PrimCanon {
+                        params: &params,
+                        results: &results,
+                        effects: effects.as_slice(),
+                        effect_mask,
+                    };
+                    let outcome = prim::store_prim(&conn, &spec)?;
+                    put_name(&conn, "prim", &full_name, &outcome.cid)?;
+                    if get_name(&conn, "prim", &symbol)?.is_none() {
+                        put_name(&conn, "prim", &symbol, &outcome.cid)?;
+                    }
+                    println!(
+                        "stored prim `{full_name}` with cid {}",
+                        cid::to_hex(&outcome.cid)
+                    );
+                }
+                CatalogItem::Word {
+                    params,
+                    results,
+                    stack,
+                } => {
+                    apply_word_catalog(
+                        &conn,
+                        &full_name,
+                        &params,
+                        &results,
+                        &stack,
+                    )?;
+                }
+                CatalogItem::Snapshot { values } => {
+                    let snapshot = GlobalStoreSnapshot::from_entries(values);
+                    let outcome = store_snapshot(&conn, &snapshot)?;
+                    put_name(&conn, "gstate", &full_name, &outcome.cid)?;
+                    println!(
+                        "stored snapshot `{full_name}` with cid {}",
+                        cid::to_hex(&outcome.cid)
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn describe_catalog_item(item: &CatalogItem) -> &'static str {
+    match item {
+        CatalogItem::Effect { .. } => "effect",
+        CatalogItem::Prim { .. } => "prim",
+        CatalogItem::Word { .. } => "word",
+        CatalogItem::Snapshot { .. } => "snapshot",
+    }
+}
+
+fn apply_word_catalog(
+    conn: &Connection,
+    full_name: &str,
+    params: &[TypeTag],
+    results: &[TypeTag],
+    stack: &[WordOp],
+) -> Result<()> {
+    let mut builder = march5::GraphBuilder::new(conn);
+    builder.begin_word(params)?;
+    for op in stack {
+        match op {
+            WordOp::Prim(name) => {
+                let cid = lookup_named_cid(conn, "prim", name)?;
+                builder.apply_prim(cid)?;
+            }
+            WordOp::Word(name) => {
+                let cid = lookup_named_cid(conn, "word", name)?;
+                builder.apply_word(cid)?;
+            }
+            WordOp::Dup => builder.dup()?,
+            WordOp::Swap => builder.swap()?,
+            WordOp::Over => builder.over()?,
+            WordOp::Lit(value) => {
+                match value {
+                    Value::I64(n) => {
+                        builder.push_lit_i64(*n)?;
+                    }
+                    other => bail!("unsupported literal in `{full_name}`: {:?}", other),
+                }
+            }
+            WordOp::Quote(cid_bytes) => {
+                builder.quote(*cid_bytes)?;
+            }
+        }
+    }
+    let word_cid = builder.finish_word(params, results, Some(full_name))?;
+    put_name(conn, "word", full_name, &word_cid)?;
+    println!("stored word `{full_name}` with cid {}", cid::to_hex(&word_cid));
+    Ok(())
+}
+
+fn lookup_named_cid(conn: &Connection, scope: &str, name: &str) -> Result<[u8; 32]> {
+    if let Some(cid) = get_name(conn, scope, name)? {
+        return Ok(cid);
+    }
+    if name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(cid::from_hex(name)?);
+    }
+    bail!("{scope} `{name}` not found in name index")
 }
 
 fn cmd_node(store: &Path, command: NodeCommand) -> Result<()> {
@@ -748,11 +982,17 @@ fn ensure_builder_begun(
     Ok(())
 }
 
-fn cmd_run(store: &Path, name: &str, args: &[i64]) -> Result<()> {
+fn cmd_run(store: &Path, name: &str, args: &[String], args_yaml: Option<&Path>) -> Result<()> {
     let conn = open_store(store)?;
     let word_cid =
         get_name(&conn, "word", name)?.ok_or_else(|| anyhow!("word `{name}` not found"))?;
-    let arg_values: Vec<Value> = args.iter().copied().map(Value::I64).collect();
+    let arg_values = if let Some(path) = args_yaml {
+        yaml::parse_values_from_file(path)?
+    } else {
+        args.iter()
+            .map(|s| parse_cli_value(s))
+            .collect::<Result<Vec<_>>>()?
+    };
     let outputs = run_word(&conn, &word_cid, &arg_values)?;
     match outputs.len() {
         0 => println!("()"),
@@ -844,6 +1084,19 @@ fn parse_effect_mask_flags(entries: &[String]) -> Result<EffectMask> {
         }
     }
     Ok(mask)
+}
+
+fn parse_cli_value(token: &str) -> Result<Value> {
+    if token == "~" || token.eq_ignore_ascii_case("null") {
+        return Ok(Value::Unit);
+    }
+    if let Ok(i) = token.parse::<i64>() {
+        return Ok(Value::I64(i));
+    }
+    if let Ok(f) = token.parse::<f64>() {
+        return Ok(Value::F64(f));
+    }
+    Ok(Value::Text(token.to_string()))
 }
 
 /// Dump the name_index rows for a given scope (optionally filtered by prefix).
@@ -983,7 +1236,9 @@ fn show_named_object(conn: &Connection, scope: &str, label: &str, name: &str) ->
 #[cfg(test)]
 mod cli_tests {
     use super::*;
-    use serde_cbor::Value;
+    use std::fs;
+    use march5::global_store;
+    use serde_cbor::Value as CborValue;
     use serde_json::json;
     use tempfile::tempdir;
 
@@ -1059,13 +1314,13 @@ mod cli_tests {
         let (kind, cbor) = load_object_cbor(&conn, &cid)?;
         assert_eq!(kind, "prim");
 
-        let value = serde_cbor::from_slice::<Value>(&cbor)?;
+        let value = serde_cbor::from_slice::<CborValue>(&cbor)?;
         let array = match value {
-            Value::Array(items) => items,
+            CborValue::Array(items) => items,
             _ => panic!("primitive CBOR must be array"),
         };
         assert_eq!(array.len(), 6);
-        assert_eq!(array[0], Value::Integer(0));
+        assert_eq!(array[0], CborValue::Integer(0));
         Ok(())
     }
 
@@ -1090,6 +1345,81 @@ mod cli_tests {
 
         let hello_found = cbor.windows(b"hello".len()).any(|w| w == b"hello");
         assert!(hello_found);
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_state_reset_clears_store() -> Result<()> {
+        global_store::reset();
+        global_store::write("demo.item", march5::Value::I64(7));
+
+        cmd_state(None, StateCommand::Reset)?;
+
+        let snapshot = global_store::snapshot();
+        assert!(snapshot.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_state_save_and_load_roundtrip() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("cli-state.march5.db");
+        let _ = create_store(&db_path)?;
+
+        global_store::reset();
+        global_store::write("demo.item", march5::Value::I64(42));
+
+        cmd_state(Some(&db_path), StateCommand::Save { name: Some("snap1".to_string()) })?;
+
+        global_store::reset();
+        assert!(global_store::snapshot().is_empty());
+
+        cmd_state(Some(&db_path), StateCommand::Load { name: "snap1".to_string() })?;
+
+        let restored = global_store::read("demo.item").expect("restored value");
+        assert_eq!(restored, march5::Value::I64(42));
+        Ok(())
+    }
+
+    #[test]
+    fn cmd_catalog_applies_yaml() -> Result<()> {
+        let dir = tempdir()?;
+        let db_path = dir.path().join("cli-catalog.march5.db");
+        let _ = create_store(&db_path)?;
+
+        let yaml_doc = r#"
+core:
+  add_i64: !prim
+    params: [i64, i64]
+    results: [i64]
+demo:
+  io: !effect
+    doc: "demo io"
+  counter: !snapshot
+    demo.counter: !i64 0
+  double: !word
+    params: [i64]
+    results: [i64]
+    stack:
+      - !dup
+      - !prim core/add_i64
+"#;
+        let yaml_path = dir.path().join("catalog.yaml");
+        fs::write(&yaml_path, yaml_doc)?;
+
+        cmd_catalog(Some(&db_path), &yaml_path, false)?;
+
+        let conn = open_store(&db_path)?;
+        let add_cid = get_name(&conn, "prim", "core/add_i64")?.expect("prim registered");
+        assert!(!add_cid.iter().all(|b| *b == 0));
+
+        let double_cid = get_name(&conn, "word", "demo/double")?.expect("word registered");
+        let outputs = run_word(&conn, &double_cid, &[Value::I64(5)])?;
+        assert_eq!(outputs.last(), Some(&Value::I64(10)));
+
+        let snapshot_cid = get_name(&conn, "gstate", "demo/counter")?.expect("snapshot");
+        let snapshot = global_store::load_snapshot(&conn, &snapshot_cid)?;
+        assert_eq!(snapshot.iter().next().unwrap().1, &Value::I64(0));
         Ok(())
     }
 }

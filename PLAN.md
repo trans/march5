@@ -2,7 +2,11 @@
 
 ## Now (unblock drift from design docs)
 
-- **Bootstrap global state backend**: stand up a mutable global store (even if backed by an in-memory stub), add state read/write prims, and route the new `State` tokens through it so the multi-domain token plumbing exercises real data flow.
+- ✅ **Broaden global store values** (2025-03-05): snapshots and state prims now handle f64s, tuples, strings, and CID-backed quotes; regression coverage exercises the new cases.
+
+- ✅ **YAML catalog loader** (2025-03-05): tagged YAML supports namespaces, effects/prims/words/snapshots, and CLI `catalog` applies documents end-to-end.
+
+- ✅ **Bootstrap global state backend** (2025-03-05): in-memory namespaced store wired through `state.read_i64`/`state.write_i64`, interpreter enforces domain tokens, CLI exposes `state snapshot/reset`.
 
 - ✅ **Generalised token pooling** (2025-03-05): interpreter/builder now emit per-domain tokens; added regression coverage for mixed IO+State words.
 

@@ -10,6 +10,7 @@ use serde_cbor::Value as CborValue;
 use std::fmt;
 
 use crate::exec::{compiled_add, compiled_sub};
+use crate::global_store;
 use crate::prim::load_prim_info;
 use crate::types::{self, EffectDomain, EffectMask, TypeTag, effect_mask};
 use crate::word::load_word_info;
@@ -240,6 +241,7 @@ pub enum Value {
     I64(i64),
     F64(f64),
     Ptr(u64),
+    Text(String),
     Unit,
     Tuple(Vec<Value>),
     Quote([u8; 32]),
@@ -252,6 +254,7 @@ impl Value {
             Value::I64(_) => TypeTag::I64,
             Value::F64(_) => TypeTag::F64,
             Value::Ptr(_) => TypeTag::Ptr,
+            Value::Text(_) => TypeTag::Text,
             Value::Unit => TypeTag::Unit,
             Value::Tuple(_) => TypeTag::Ptr,
             Value::Quote(_) => TypeTag::Ptr,
@@ -269,6 +272,7 @@ impl fmt::Display for Value {
             Value::I64(n) => write!(f, "{n}"),
             Value::F64(x) => write!(f, "{x}"),
             Value::Ptr(ptr) => write!(f, "0x{ptr:016x}"),
+            Value::Text(s) => write!(f, "\"{}\"", s.escape_default()),
             Value::Unit => write!(f, "()"),
             Value::Tuple(values) => {
                 let body = values
@@ -623,6 +627,16 @@ fn value_to_ptr(value: &Value) -> Result<u64> {
     }
 }
 
+fn quote_key(value: &Value) -> Result<String> {
+    match value {
+        Value::Quote(cid_bytes) => Ok(cid::to_hex(cid_bytes)),
+        other => bail!(
+            "state primitive expects quote identifier key, got {:?}",
+            other.type_tag()
+        ),
+    }
+}
+
 fn decode_guard_type_key(bytes: &[u8]) -> Result<TypeTag> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     let slice = &bytes[..end];
@@ -636,37 +650,152 @@ fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) ->
         .into_iter()
         .next();
 
-    let ints: Vec<i64> = inputs.iter().map(value_to_i64).collect::<Result<_>>()?;
-
-    let value = match name.as_deref() {
+    match name.as_deref() {
         Some("add_i64") => {
             require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
-            if ints.len() != 2 {
-                bail!("add_i64 expects 2 arguments, got {}", ints.len());
+            if inputs.len() != 2 {
+                bail!("add_i64 expects 2 arguments, got {}", inputs.len());
             }
-            match compiled_add() {
-                Ok(func) => unsafe { Value::I64(func(ints[0], ints[1])) },
-                Err(_) => Value::I64(ints[0] + ints[1]),
-            }
+            let lhs = value_to_i64(&inputs[0])?;
+            let rhs = value_to_i64(&inputs[1])?;
+            let result = match compiled_add() {
+                Ok(func) => unsafe { func(lhs, rhs) },
+                Err(_) => lhs + rhs,
+            };
+            Ok(Value::I64(result))
         }
         Some("sub_i64") => {
             require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
-            if ints.len() != 2 {
-                bail!("sub_i64 expects 2 arguments, got {}", ints.len());
+            if inputs.len() != 2 {
+                bail!("sub_i64 expects 2 arguments, got {}", inputs.len());
             }
-            match compiled_sub() {
-                Ok(func) => unsafe { Value::I64(func(ints[0], ints[1])) },
-                Err(_) => Value::I64(ints[0] - ints[1]),
+            let lhs = value_to_i64(&inputs[0])?;
+            let rhs = value_to_i64(&inputs[1])?;
+            let result = match compiled_sub() {
+                Ok(func) => unsafe { func(lhs, rhs) },
+                Err(_) => lhs - rhs,
+            };
+            Ok(Value::I64(result))
+        }
+        Some("state.read_i64") => {
+            require_sig(&info, &[TypeTag::Ptr], &[TypeTag::I64])?;
+            if inputs.len() != 1 {
+                bail!("state.read_i64 expects 1 argument, got {}", inputs.len());
             }
+            let key = quote_key(&inputs[0])?;
+            match global_store::read(&key) {
+                Some(Value::I64(n)) => Ok(Value::I64(n)),
+                Some(other) => bail!(
+                    "state entry `{key}` holds incompatible value {:?}",
+                    other.type_tag()
+                ),
+                None => bail!("state entry `{key}` not found"),
+            }
+        }
+        Some("state.read_f64") => {
+            require_sig(&info, &[TypeTag::Ptr], &[TypeTag::F64])?;
+            if inputs.len() != 1 {
+                bail!("state.read_f64 expects 1 argument, got {}", inputs.len());
+            }
+            let key = quote_key(&inputs[0])?;
+            match global_store::read(&key) {
+                Some(Value::F64(x)) => Ok(Value::F64(x)),
+                Some(other) => bail!(
+                    "state entry `{key}` holds incompatible value {:?}",
+                    other.type_tag()
+                ),
+                None => bail!("state entry `{key}` not found"),
+            }
+        }
+        Some("state.read_ptr") => {
+            require_sig(&info, &[TypeTag::Ptr], &[TypeTag::Ptr])?;
+            if inputs.len() != 1 {
+                bail!("state.read_ptr expects 1 argument, got {}", inputs.len());
+            }
+            let key = quote_key(&inputs[0])?;
+            match global_store::read(&key) {
+                Some(Value::Tuple(values)) => Ok(Value::Tuple(values)),
+                Some(Value::Quote(cid)) => Ok(Value::Quote(cid)),
+                Some(other) => bail!(
+                    "state entry `{key}` holds incompatible value {:?}",
+                    other.type_tag()
+                ),
+                None => bail!("state entry `{key}` not found"),
+            }
+        }
+        Some("state.read_text") => {
+            require_sig(&info, &[TypeTag::Ptr], &[TypeTag::Text])?;
+            if inputs.len() != 1 {
+                bail!("state.read_text expects 1 argument, got {}", inputs.len());
+            }
+            let key = quote_key(&inputs[0])?;
+            match global_store::read(&key) {
+                Some(Value::Text(s)) => Ok(Value::Text(s)),
+                Some(other) => bail!(
+                    "state entry `{key}` holds incompatible value {:?}",
+                    other.type_tag()
+                ),
+                None => bail!("state entry `{key}` not found"),
+            }
+        }
+        Some("state.write_i64") => {
+            require_sig(&info, &[TypeTag::Ptr, TypeTag::I64], &[TypeTag::Unit])?;
+            if inputs.len() != 2 {
+                bail!("state.write_i64 expects 2 arguments, got {}", inputs.len());
+            }
+            let key = quote_key(&inputs[0])?;
+            let value = value_to_i64(&inputs[1])?;
+            global_store::write(key, Value::I64(value));
+            Ok(Value::Unit)
+        }
+        Some("state.write_f64") => {
+            require_sig(&info, &[TypeTag::Ptr, TypeTag::F64], &[TypeTag::Unit])?;
+            if inputs.len() != 2 {
+                bail!("state.write_f64 expects 2 arguments, got {}", inputs.len());
+            }
+            let key = quote_key(&inputs[0])?;
+            let value = value_to_f64(&inputs[1])?;
+            global_store::write(key, Value::F64(value));
+            Ok(Value::Unit)
+        }
+        Some("state.write_ptr") => {
+            require_sig(&info, &[TypeTag::Ptr, TypeTag::Ptr], &[TypeTag::Unit])?;
+            if inputs.len() != 2 {
+                bail!("state.write_ptr expects 2 arguments, got {}", inputs.len());
+            }
+            let key = quote_key(&inputs[0])?;
+            let value = match &inputs[1] {
+                Value::Tuple(_) | Value::Quote(_) => inputs[1].clone(),
+                other => bail!(
+                    "state.write_ptr expects tuple or quote value, got {:?}",
+                    other.type_tag()
+                ),
+            };
+            global_store::write(key, value);
+            Ok(Value::Unit)
+        }
+        Some("state.write_text") => {
+            require_sig(&info, &[TypeTag::Ptr, TypeTag::Text], &[TypeTag::Unit])?;
+            if inputs.len() != 2 {
+                bail!("state.write_text expects 2 arguments, got {}", inputs.len());
+            }
+            let key = quote_key(&inputs[0])?;
+            let value = match &inputs[1] {
+                Value::Text(s) => Value::Text(s.clone()),
+                other => bail!(
+                    "state.write_text expects text value, got {:?}",
+                    other.type_tag()
+                ),
+            };
+            global_store::write(key, value);
+            Ok(Value::Unit)
         }
         Some(other) => bail!("primitive `{other}` not supported in runner"),
         None => bail!(
             "primitive {} not registered with a name (runner needs a symbolic name)",
             cid::to_hex(prim_cid)
         ),
-    };
-
-    Ok(value)
+    }
 }
 
 #[cfg(test)]
@@ -677,6 +806,7 @@ mod tests {
     use crate::prim::{self, PrimCanon};
     use crate::store;
     use crate::types::{EffectDomain, TypeTag, effect_mask};
+    use crate::global_store;
 
     fn guard_key(tag: TypeTag) -> [u8; 32] {
         let mut bytes = [0u8; 32];
@@ -736,6 +866,214 @@ mod tests {
         assert_eq!(outputs[0], Value::Token(Some(EffectDomain::Io)));
         assert_eq!(outputs[1], Value::Token(Some(EffectDomain::State)));
         assert_eq!(outputs[2], Value::I64(3));
+        Ok(())
+    }
+
+    #[test]
+    fn state_read_write_roundtrip() -> Result<()> {
+        global_store::reset();
+
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let key = [0xAA; 32];
+
+        let read_params = [TypeTag::Ptr];
+        let read_results = [TypeTag::I64];
+        let read_prim = PrimCanon {
+            params: &read_params,
+            results: &read_results,
+            effects: &[],
+            effect_mask: effect_mask::STATE_READ,
+        };
+        let read_outcome = prim::store_prim(&conn, &read_prim)?;
+        store::put_name(&conn, "prim", "state.read_i64", &read_outcome.cid)?;
+
+        let write_params = [TypeTag::Ptr, TypeTag::I64];
+        let write_results = [TypeTag::Unit];
+        let write_prim = PrimCanon {
+            params: &write_params,
+            results: &write_results,
+            effects: &[],
+            effect_mask: effect_mask::STATE_WRITE,
+        };
+        let write_outcome = prim::store_prim(&conn, &write_prim)?;
+        store::put_name(&conn, "prim", "state.write_i64", &write_outcome.cid)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[])?;
+        builder.quote(key)?;
+        builder.push_lit_i64(99)?;
+        builder.apply_prim(write_outcome.cid)?;
+        builder.drop()?;
+        builder.quote(key)?;
+        builder.apply_prim(read_outcome.cid)?;
+        let word_cid = builder.finish_word(&[], &[TypeTag::I64], Some("state/test"))?;
+
+        let outputs = run_word(&conn, &word_cid, &[])?;
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], Value::Token(Some(EffectDomain::State)));
+        assert_eq!(outputs[1], Value::I64(99));
+
+        let stored = global_store::read(&cid::to_hex(&key)).expect("value persisted");
+        assert_eq!(stored, Value::I64(99));
+        Ok(())
+    }
+
+    #[test]
+    fn state_read_write_f64_roundtrip() -> Result<()> {
+        global_store::reset();
+
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let key = [0xBB; 32];
+
+        let read_params = [TypeTag::Ptr];
+        let read_results = [TypeTag::F64];
+        let read_prim = PrimCanon {
+            params: &read_params,
+            results: &read_results,
+            effects: &[],
+            effect_mask: effect_mask::STATE_READ,
+        };
+        let read_outcome = prim::store_prim(&conn, &read_prim)?;
+        store::put_name(&conn, "prim", "state.read_f64", &read_outcome.cid)?;
+
+        let write_params = [TypeTag::Ptr, TypeTag::F64];
+        let write_results = [TypeTag::Unit];
+        let write_prim = PrimCanon {
+            params: &write_params,
+            results: &write_results,
+            effects: &[],
+            effect_mask: effect_mask::STATE_WRITE,
+        };
+        let write_outcome = prim::store_prim(&conn, &write_prim)?;
+        store::put_name(&conn, "prim", "state.write_f64", &write_outcome.cid)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[TypeTag::F64])?;
+        builder.quote(key)?;
+        builder.swap()?;
+        builder.apply_prim(write_outcome.cid)?;
+        builder.drop()?;
+        builder.quote(key)?;
+        builder.apply_prim(read_outcome.cid)?;
+        let word_cid = builder.finish_word(&[TypeTag::F64], &[TypeTag::F64], Some("state/f64"))?;
+
+        let outputs = run_word(&conn, &word_cid, &[Value::F64(3.25)])?;
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], Value::Token(Some(EffectDomain::State)));
+        assert_eq!(outputs[1], Value::F64(3.25));
+
+        let stored = global_store::read(&cid::to_hex(&key)).expect("value persisted");
+        assert_eq!(stored, Value::F64(3.25));
+        Ok(())
+    }
+
+    #[test]
+    fn state_read_write_ptr_tuple() -> Result<()> {
+        global_store::reset();
+
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let key = [0xCC; 32];
+
+        let read_params = [TypeTag::Ptr];
+        let read_results = [TypeTag::Ptr];
+        let read_prim = PrimCanon {
+            params: &read_params,
+            results: &read_results,
+            effects: &[],
+            effect_mask: effect_mask::STATE_READ,
+        };
+        let read_outcome = prim::store_prim(&conn, &read_prim)?;
+        store::put_name(&conn, "prim", "state.read_ptr", &read_outcome.cid)?;
+
+        let write_params = [TypeTag::Ptr, TypeTag::Ptr];
+        let write_results = [TypeTag::Unit];
+        let write_prim = PrimCanon {
+            params: &write_params,
+            results: &write_results,
+            effects: &[],
+            effect_mask: effect_mask::STATE_WRITE,
+        };
+        let write_outcome = prim::store_prim(&conn, &write_prim)?;
+        store::put_name(&conn, "prim", "state.write_ptr", &write_outcome.cid)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[])?;
+        builder.quote(key)?;
+        builder.push_lit_i64(1)?;
+        builder.push_lit_i64(2)?;
+        builder.pair()?;
+        builder.apply_prim(write_outcome.cid)?;
+        builder.drop()?;
+        builder.quote(key)?;
+        builder.apply_prim(read_outcome.cid)?;
+        builder.unpair(TypeTag::I64, TypeTag::I64)?;
+        let word_cid = builder.finish_word(&[], &[TypeTag::I64, TypeTag::I64], Some("state/pair"))?;
+
+        let outputs = run_word(&conn, &word_cid, &[])?;
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0], Value::Token(Some(EffectDomain::State)));
+        assert_eq!(outputs[1], Value::I64(1));
+        assert_eq!(outputs[2], Value::I64(2));
+
+        let stored = global_store::read(&cid::to_hex(&key)).expect("value persisted");
+        assert_eq!(stored, Value::Tuple(vec![Value::I64(1), Value::I64(2)]));
+        Ok(())
+    }
+
+    #[test]
+    fn state_read_write_text() -> Result<()> {
+        global_store::reset();
+
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let key = [0xDD; 32];
+
+        let read_params = [TypeTag::Ptr];
+        let read_results = [TypeTag::Text];
+        let read_prim = PrimCanon {
+            params: &read_params,
+            results: &read_results,
+            effects: &[],
+            effect_mask: effect_mask::STATE_READ,
+        };
+        let read_outcome = prim::store_prim(&conn, &read_prim)?;
+        store::put_name(&conn, "prim", "state.read_text", &read_outcome.cid)?;
+
+        let write_params = [TypeTag::Ptr, TypeTag::Text];
+        let write_results = [TypeTag::Unit];
+        let write_prim = PrimCanon {
+            params: &write_params,
+            results: &write_results,
+            effects: &[],
+            effect_mask: effect_mask::STATE_WRITE,
+        };
+        let write_outcome = prim::store_prim(&conn, &write_prim)?;
+        store::put_name(&conn, "prim", "state.write_text", &write_outcome.cid)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[TypeTag::Text])?;
+        builder.quote(key)?;
+        builder.swap()?;
+        builder.apply_prim(write_outcome.cid)?;
+        builder.drop()?;
+        builder.quote(key)?;
+        builder.apply_prim(read_outcome.cid)?;
+        let word_cid = builder.finish_word(&[TypeTag::Text], &[TypeTag::Text], Some("state/text"))?;
+
+        let outputs = run_word(&conn, &word_cid, &[Value::Text("hello".to_string())])?;
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], Value::Token(Some(EffectDomain::State)));
+        assert_eq!(outputs[1], Value::Text("hello".to_string()));
+
+        let stored = global_store::read(&cid::to_hex(&key)).expect("value persisted");
+        assert_eq!(stored, Value::Text("hello".to_string()));
         Ok(())
     }
 

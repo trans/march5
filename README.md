@@ -88,6 +88,22 @@ Run a word directly from the CLI (pass `--arg` per parameter when needed):
 cargo run --bin march5 -- --db examples/helloworld.march5.db run org.march.helloworld/hello
 ```
 
+You can also supply typed arguments via YAML tags (supported tags include
+`!i64`, `!f64`, `!text`, `!tuple`, `!quote`, and `!unit`):
+
+```yaml
+# args.yaml
+- !i64 42
+- !text "hello"
+- !tuple
+  - !i64 1
+  - !i64 2
+```
+
+```bash
+cargo run --bin march5 -- --db demo.march5.db run demo.math/some_word --args-yaml args.yaml
+```
+
 Create a literal node (produces a canonical node object and prints its CID):
 
 ```bash
@@ -112,6 +128,47 @@ List the registered words under a namespace prefix:
 ```bash
 target/release/march5 --db demo.march5.db word list --prefix demo.math/
 ```
+
+## YAML catalog loader
+
+The `catalog` subcommand consumes a YAML document that mirrors the March
+namespacing scheme. Tags describe the type of each entry:
+
+- `!effect` — stores a canonical effect (optional `doc` field)
+- `!prim` — declares a primitive (`params`, `results`, optional `effects`, `emask`)
+- `!word` — builds a word via a simple stack sequence (`params`, `results`, `stack`)
+- `!snapshot` — writes a global-store snapshot (keys map to tagged values)
+
+Example (`catalog.yaml`):
+
+```yaml
+core:
+  add_i64: !prim
+    params: [i64, i64]
+    results: [i64]
+
+demo:
+  io: !effect
+    doc: "performs IO"
+  counter: !snapshot
+    demo.counter: !i64 0
+  double: !word
+    params: [i64]
+    results: [i64]
+    stack:
+      - !dup
+      - !prim core/add_i64
+```
+
+Apply it (persisting everything into the connected store):
+
+```bash
+target/release/march5 --db demo.march5.db catalog catalog.yaml
+```
+
+Use `--dry-run` to preview what would be created without mutating the store.
+All values accept the same local tags as the YAML argument loader, so complex
+snapshots and literal graph data can be described succinctly.
 
 ## CLI reference
 
