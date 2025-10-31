@@ -3,6 +3,7 @@
 //! Shared helpers and enums for encoding type signatures across March objects.
 
 use anyhow::{Result, bail};
+use smallvec::SmallVec;
 
 use crate::cbor::{push_array, push_map, push_text};
 
@@ -17,6 +18,53 @@ pub mod effect_mask {
     pub const STATE_WRITE: EffectMask = 1 << 2;
     pub const TEST: EffectMask = 1 << 3;
     pub const METRIC: EffectMask = 1 << 4;
+}
+
+/// Logical domains that drive token threading in the builder/interpreter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum EffectDomain {
+    Io,
+    State,
+    Test,
+    Metric,
+}
+
+/// Translate a bitmask into the ordered set of effect domains it touches.
+pub fn effect_domains(mask: EffectMask) -> SmallVec<[EffectDomain; 4]> {
+    let mut domains = SmallVec::<[EffectDomain; 4]>::new();
+    if mask_has(mask, effect_mask::IO) {
+        domains.push(EffectDomain::Io);
+    }
+    if mask_has(mask, effect_mask::STATE_READ) || mask_has(mask, effect_mask::STATE_WRITE) {
+        domains.push(EffectDomain::State);
+    }
+    if mask_has(mask, effect_mask::TEST) {
+        domains.push(EffectDomain::Test);
+    }
+    if mask_has(mask, effect_mask::METRIC) {
+        domains.push(EffectDomain::Metric);
+    }
+    domains
+}
+
+/// Convenience helper to map a domain back to its bit flag.
+pub fn effect_mask_for_domain(domain: EffectDomain) -> EffectMask {
+    match domain {
+        EffectDomain::Io => effect_mask::IO,
+        EffectDomain::State => effect_mask::STATE_READ | effect_mask::STATE_WRITE,
+        EffectDomain::Test => effect_mask::TEST,
+        EffectDomain::Metric => effect_mask::METRIC,
+    }
+}
+
+/// Helper to map an effect domain into its dedicated token type tag.
+pub fn token_tag_for_domain(domain: EffectDomain) -> TypeTag {
+    match domain {
+        EffectDomain::Io => TypeTag::IoToken,
+        EffectDomain::State => TypeTag::StateToken,
+        EffectDomain::Test => TypeTag::TestToken,
+        EffectDomain::Metric => TypeTag::MetricToken,
+    }
 }
 
 #[inline]
@@ -34,6 +82,8 @@ pub enum TypeTag {
     Token,
     StateToken,
     IoToken,
+    TestToken,
+    MetricToken,
 }
 
 impl TypeTag {
@@ -47,6 +97,8 @@ impl TypeTag {
             TypeTag::Token => "token",
             TypeTag::StateToken => "state.token",
             TypeTag::IoToken => "io.token",
+            TypeTag::TestToken => "test.token",
+            TypeTag::MetricToken => "metric.token",
         }
     }
 
@@ -60,8 +112,33 @@ impl TypeTag {
             "token" => Ok(TypeTag::Token),
             "state.token" => Ok(TypeTag::StateToken),
             "io.token" => Ok(TypeTag::IoToken),
+            "test.token" => Ok(TypeTag::TestToken),
+            "metric.token" => Ok(TypeTag::MetricToken),
             other => bail!("unknown type atom `{other}`"),
         }
+    }
+
+    /// Return the effect domain encoded by this token type, if any.
+    pub fn token_domain(self) -> Option<EffectDomain> {
+        match self {
+            TypeTag::IoToken => Some(EffectDomain::Io),
+            TypeTag::StateToken => Some(EffectDomain::State),
+            TypeTag::TestToken => Some(EffectDomain::Test),
+            TypeTag::MetricToken => Some(EffectDomain::Metric),
+            _ => None,
+        }
+    }
+
+    /// True when this tag represents any token type (including domainless).
+    pub fn is_token(self) -> bool {
+        matches!(
+            self,
+            TypeTag::Token
+                | TypeTag::IoToken
+                | TypeTag::StateToken
+                | TypeTag::TestToken
+                | TypeTag::MetricToken
+        )
     }
 }
 

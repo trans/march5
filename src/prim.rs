@@ -41,8 +41,8 @@ pub struct PrimInfo {
 /// Encode a primitive into canonical CBOR.
 pub fn encode(prim: &PrimCanon) -> Vec<u8> {
     let mut buf = Vec::new();
-    // [tag, rootCID, params[], results[], effects[]]
-    push_array(&mut buf, 5);
+    // [tag, rootCID, params[], results[], effects[], mask]
+    push_array(&mut buf, 6);
     crate::cbor::push_u32(&mut buf, 0); // object tag for "prim"
     push_bytes(&mut buf, &[0u8; 32]); // reserved root slot (always zero for prims)
 
@@ -57,6 +57,7 @@ pub fn encode(prim: &PrimCanon) -> Vec<u8> {
     }
 
     encode_effects(&mut buf, prim.effects);
+    crate::cbor::push_u32(&mut buf, prim.effect_mask);
     buf
 }
 
@@ -75,7 +76,7 @@ pub fn load_prim_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<PrimInf
         [cid_bytes.as_slice()],
         |row| row.get(0),
     )?;
-    let PrimRecord(tag, root, params_raw, results_raw, effects_raw) =
+    let PrimRecord(tag, root, params_raw, results_raw, effects_raw, mask_opt) =
         serde_cbor::from_slice(&cbor).with_context(|| "failed to decode primitive CBOR payload")?;
     if tag != 0 {
         bail!("object tag mismatch while loading prim: {}", tag);
@@ -108,11 +109,11 @@ pub fn load_prim_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<PrimInf
         })
         .collect::<Result<Vec<_>>>()
         .with_context(|| "failed to parse prim effects")?;
-    let effect_mask_value = if effects.is_empty() {
+    let effect_mask_value = mask_opt.unwrap_or(if effects.is_empty() {
         effect_mask::NONE
     } else {
         effect_mask::IO
-    };
+    });
 
     Ok(PrimInfo {
         params,
@@ -132,7 +133,14 @@ fn encode_effects(buf: &mut Vec<u8>, effects: &[[u8; 32]]) {
 }
 
 #[derive(Deserialize)]
-struct PrimRecord(u64, ByteBuf, Vec<String>, Vec<String>, Vec<ByteBuf>);
+struct PrimRecord(
+    u64,
+    ByteBuf,
+    Vec<String>,
+    Vec<String>,
+    Vec<ByteBuf>,
+    #[serde(default)] Option<u32>,
+);
 
 #[cfg(test)]
 mod tests {
@@ -154,7 +162,7 @@ mod tests {
             serde_cbor::from_slice(&encoded).expect("valid CBOR encoding");
         match value {
             serde_cbor::Value::Array(items) => {
-                assert_eq!(items.len(), 5);
+                assert_eq!(items.len(), 6);
                 assert_eq!(items[0], serde_cbor::Value::Integer(0));
                 match &items[1] {
                     serde_cbor::Value::Bytes(bytes) => {
@@ -164,6 +172,7 @@ mod tests {
                     other => panic!("expected bytes for root slot, got {other:?}"),
                 }
                 assert!(matches!(items[4], serde_cbor::Value::Array(ref arr) if arr.is_empty()));
+                assert_eq!(items[5], serde_cbor::Value::Integer(0));
             }
             other => panic!("expected array encoding, got {other:?}"),
         }
@@ -187,6 +196,7 @@ mod tests {
         assert_eq!(info.params, params);
         assert_eq!(info.results, results);
         assert!(info.effects.is_empty());
+        assert_eq!(info.effect_mask, effect_mask::NONE);
         Ok(())
     }
 
@@ -199,14 +209,14 @@ mod tests {
             params: &params,
             results: &results,
             effects: &effects,
-            effect_mask: effect_mask::IO,
+            effect_mask: effect_mask::STATE_WRITE,
         };
         let conn = Connection::open_in_memory()?;
         crate::store::install_schema(&conn)?;
         let outcome = store_prim(&conn, &prim)?;
         let info = load_prim_info(&conn, &outcome.cid)?;
         assert_eq!(info.effects, effects);
-        assert_eq!(info.effect_mask, effect_mask::IO);
+        assert_eq!(info.effect_mask, effect_mask::STATE_WRITE);
         Ok(())
     }
 }

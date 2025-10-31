@@ -9,7 +9,7 @@ use march5::iface::{self, IfaceCanon, IfaceSymbol};
 use march5::namespace::{self, NamespaceCanon, NamespaceExport};
 use march5::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use march5::prim::{self, PrimCanon};
-use march5::types::effect_mask;
+use march5::types::{effect_mask, EffectMask};
 use march5::word::{self, WordCanon};
 use march5::{
     TypeTag, Value, cid, create_store, derive_db_path, get_name, load_object_cbor, open_store,
@@ -103,6 +103,9 @@ enum PrimCommand {
         /// Declared effect CIDs
         #[arg(long = "effect", value_name = "CID")]
         effects: Vec<String>,
+        /// Explicit effect mask domains (e.g. io, state.write, test)
+        #[arg(long = "emask", value_name = "DOMAIN")]
+        emask: Vec<String>,
         /// Skip name_index registration
         #[arg(long = "no-register")]
         no_register: bool,
@@ -230,6 +233,9 @@ enum WordCommand {
         /// Declared effect CIDs
         #[arg(long = "effect", value_name = "CID")]
         effects: Vec<String>,
+        /// Explicit effect mask domains (e.g. io, state.write, test)
+        #[arg(long = "emask", value_name = "DOMAIN")]
+        emask: Vec<String>,
         #[arg(long = "no-register")]
         no_register: bool,
     },
@@ -324,21 +330,22 @@ fn cmd_prim(store: &Path, command: PrimCommand) -> Result<()> {
             params,
             results,
             effects,
+            emask,
             no_register,
         } => {
             let conn = open_store(store)?;
             let param_tags = parse_type_tags(&params)?;
             let result_tags = parse_type_tags(&results)?;
             let effect_cids = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
+            let mut effect_mask_value = parse_effect_mask_flags(&emask)?;
+            if effect_mask_value == effect_mask::NONE && !effect_cids.is_empty() {
+                effect_mask_value = effect_mask::IO;
+            }
             let spec = PrimCanon {
                 params: &param_tags,
                 results: &result_tags,
                 effects: effect_cids.as_slice(),
-                effect_mask: if effect_cids.is_empty() {
-                    effect_mask::NONE
-                } else {
-                    effect_mask::IO
-                },
+                effect_mask: effect_mask_value,
             };
             let outcome = prim::store_prim(&conn, &spec)?;
             if !no_register {
@@ -563,20 +570,22 @@ fn cmd_word(store: &Path, command: WordCommand) -> Result<()> {
             params,
             results,
             effects,
+            emask,
             no_register,
         } => {
             let conn = open_store(store)?;
             let root_cid = cid::from_hex(&root)?;
+            let effect_cids = parse_cid_list(effects.iter().map(|s| s.as_str()))?;
+            let mut effect_mask_value = parse_effect_mask_flags(&emask)?;
+            if effect_mask_value == effect_mask::NONE && !effect_cids.is_empty() {
+                effect_mask_value = effect_mask::IO;
+            }
             let word = WordCanon {
                 root: root_cid,
                 params,
                 results,
-                effects: parse_cid_list(effects.iter().map(|s| s.as_str()))?,
-                effect_mask: if effects.is_empty() {
-                    effect_mask::NONE
-                } else {
-                    effect_mask::IO
-                },
+                effects: effect_cids,
+                effect_mask: effect_mask_value,
             };
             let outcome = word::store_word(&conn, &word)?;
             if !no_register {
@@ -817,6 +826,26 @@ fn parse_inputs(entries: &[String]) -> Result<Vec<NodeInput>> {
     Ok(inputs)
 }
 
+fn parse_effect_mask_flags(entries: &[String]) -> Result<EffectMask> {
+    let mut mask = effect_mask::NONE;
+    for entry in entries {
+        let flag = entry.trim().to_ascii_lowercase();
+        if flag.is_empty() {
+            continue;
+        }
+        match flag.as_str() {
+            "io" => mask |= effect_mask::IO,
+            "state" => mask |= effect_mask::STATE_READ | effect_mask::STATE_WRITE,
+            "state.read" | "state_read" | "state-read" => mask |= effect_mask::STATE_READ,
+            "state.write" | "state_write" | "state-write" => mask |= effect_mask::STATE_WRITE,
+            "test" => mask |= effect_mask::TEST,
+            "metric" => mask |= effect_mask::METRIC,
+            other => bail!("unknown effect mask domain `{other}`"),
+        }
+    }
+    Ok(mask)
+}
+
 /// Dump the name_index rows for a given scope (optionally filtered by prefix).
 fn list_scope(conn: &Connection, scope: &str, prefix: Option<&str>, empty_msg: &str) -> Result<()> {
     let sql_prefix =
@@ -1020,6 +1049,7 @@ mod cli_tests {
                 params: vec!["i64".to_string(), "i64".to_string()],
                 results: vec!["i64".to_string()],
                 effects: vec![],
+                emask: vec![],
                 no_register: false,
             },
         )?;
@@ -1034,7 +1064,7 @@ mod cli_tests {
             Value::Array(items) => items,
             _ => panic!("primitive CBOR must be array"),
         };
-        assert_eq!(array.len(), 5);
+        assert_eq!(array.len(), 6);
         assert_eq!(array[0], Value::Integer(0));
         Ok(())
     }

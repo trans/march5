@@ -11,9 +11,10 @@ use std::fmt;
 
 use crate::exec::{compiled_add, compiled_sub};
 use crate::prim::load_prim_info;
-use crate::types::{TypeTag, effect_mask, mask_has};
+use crate::types::{self, EffectDomain, EffectMask, TypeTag, effect_mask};
 use crate::word::load_word_info;
 use crate::{cid, list_names_for_cid, load_object_cbor};
+use smallvec::SmallVec;
 
 /// Evaluates a word and returns its single `i64` result.
 /// Currently supports words whose parameters and results are all `i64`.
@@ -37,18 +38,10 @@ pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32], args: &[i64]) -> Res
     }
     let arg_values: Vec<Value> = args.iter().copied().map(Value::I64).collect();
     let mut results = run_word_with_info(conn, &info, &arg_values)?;
-    let expects_token = if info.effect_mask == effect_mask::NONE {
-        !info.effects.is_empty()
-    } else {
-        mask_has(info.effect_mask, effect_mask::IO)
-    };
-    if expects_token {
-        match results.first() {
-            Some(Value::Token) => {
-                results.remove(0);
-            }
-            _ => bail!("effectful word missing token output"),
-        }
+    let token_domains = wrap_token_domains(&word_token_domains(&info));
+    validate_output_tokens(&results, &token_domains)?;
+    if !token_domains.is_empty() {
+        results.drain(0..token_domains.len());
     }
     let value = results
         .pop()
@@ -63,6 +56,108 @@ pub fn run_word_i64(conn: &Connection, word_cid: &[u8; 32], args: &[i64]) -> Res
 pub fn run_word(conn: &Connection, word_cid: &[u8; 32], args: &[Value]) -> Result<Vec<Value>> {
     let info = load_word_info(conn, word_cid)?;
     run_word_with_info(conn, &info, args)
+}
+
+fn normalize_effect_mask(mask: EffectMask, has_effects: bool) -> EffectMask {
+    if mask == effect_mask::NONE && has_effects {
+        effect_mask::IO
+    } else {
+        mask
+    }
+}
+
+fn mask_token_domains(mask: EffectMask, has_effects: bool) -> SmallVec<[EffectDomain; 4]> {
+    let normalized = normalize_effect_mask(mask, has_effects);
+    types::effect_domains(normalized)
+}
+
+fn word_token_domains(info: &crate::word::WordInfo) -> SmallVec<[EffectDomain; 4]> {
+    mask_token_domains(info.effect_mask, !info.effects.is_empty())
+}
+
+fn token_values(domains: &[Option<EffectDomain>]) -> Vec<Value> {
+    domains
+        .iter()
+        .map(|domain| Value::Token(*domain))
+        .collect()
+}
+
+fn wrap_token_domains(domains: &[EffectDomain]) -> Vec<Option<EffectDomain>> {
+    domains.iter().map(|d| Some(*d)).collect()
+}
+
+fn consume_token_inputs(
+    inputs: &mut Vec<Value>,
+    expected: &[Option<EffectDomain>],
+) -> Result<()> {
+    for domain in expected.iter().rev() {
+        let value = inputs
+            .pop()
+            .ok_or_else(|| anyhow!("effectful node missing token input"))?;
+        match (value, domain) {
+            (Value::Token(Some(actual)), Some(expected_domain)) if actual == *expected_domain => {}
+            (Value::Token(Some(actual)), Some(expected_domain)) => {
+                bail!(
+                    "effectful node received token for domain {:?}, expected {:?}",
+                    actual,
+                    *expected_domain
+                );
+            }
+            (Value::Token(_), None) => {}
+            (Value::Token(None), Some(expected_domain)) => {
+                bail!(
+                    "effectful node received generic token, expected {:?}",
+                    *expected_domain
+                );
+            }
+            (other, _) => bail!("effectful node missing token input, got {:?}", other.type_tag()),
+        }
+    }
+    Ok(())
+}
+
+fn validate_output_tokens(outputs: &[Value], expected: &[Option<EffectDomain>]) -> Result<()> {
+    if outputs.len() < expected.len() {
+        bail!(
+            "effectful node expected {} token output(s), found {}",
+            expected.len(),
+            outputs.len()
+        );
+    }
+    for (idx, expected_domain) in expected.iter().enumerate() {
+        match (outputs.get(idx), expected_domain) {
+            (Some(Value::Token(Some(actual))), Some(expected)) if *actual == *expected => {}
+            (Some(Value::Token(Some(actual))), Some(expected)) => {
+                bail!(
+                    "node returned token for domain {:?}, expected {:?}",
+                    *actual,
+                    *expected
+                );
+            }
+            (Some(Value::Token(Some(_))), None) => {}
+            (Some(Value::Token(None)), Some(expected)) => {
+                bail!(
+                    "node returned generic token, expected {:?}",
+                    *expected
+                );
+            }
+            (Some(Value::Token(None)), None) => {}
+            (Some(other), _) => {
+                bail!(
+                    "effectful node missing token output at index {} (got {:?})",
+                    idx,
+                    other.type_tag()
+                );
+            }
+            (None, _) => {
+                bail!(
+                    "effectful node missing token output at index {}",
+                    idx
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_word_with_info(
@@ -88,19 +183,9 @@ fn run_word_with_info(
         }
     }
     let mut cache: HashMap<[u8; 32], Vec<Value>> = HashMap::new();
-    let outputs = eval_return(conn, &info.root, &mut cache, args, &info.results)?;
-    let has_token = if info.effect_mask == effect_mask::NONE {
-        !info.effects.is_empty()
-    } else {
-        mask_has(info.effect_mask, effect_mask::IO)
-    };
-    if has_token {
-        match outputs.first() {
-            Some(Value::Token) => {}
-            _ => bail!("effectful word missing token output"),
-        }
-    }
-    let expected_len = info.results.len() + if has_token { 1 } else { 0 };
+    let outputs = eval_return(conn, &info.root, &mut cache, args, info)?;
+    let token_domains = wrap_token_domains(&word_token_domains(info));
+    let expected_len = info.results.len() + token_domains.len();
     if outputs.len() != expected_len {
         bail!(
             "result count mismatch: word declares {}, runner produced {}",
@@ -108,10 +193,11 @@ fn run_word_with_info(
             outputs.len()
         );
     }
+    validate_output_tokens(&outputs, &token_domains)?;
     for (idx, (expected, actual)) in info
         .results
         .iter()
-        .zip(outputs.iter().skip(if has_token { 1 } else { 0 }))
+        .zip(outputs.iter().skip(token_domains.len()))
         .enumerate()
     {
         if actual.type_tag() != *expected {
@@ -157,7 +243,7 @@ pub enum Value {
     Unit,
     Tuple(Vec<Value>),
     Quote([u8; 32]),
-    Token,
+    Token(Option<EffectDomain>),
 }
 
 impl Value {
@@ -169,7 +255,10 @@ impl Value {
             Value::Unit => TypeTag::Unit,
             Value::Tuple(_) => TypeTag::Ptr,
             Value::Quote(_) => TypeTag::Ptr,
-            Value::Token => TypeTag::Token,
+            Value::Token(domain) => match domain {
+                Some(d) => types::token_tag_for_domain(*d),
+                None => TypeTag::Token,
+            },
         }
     }
 }
@@ -190,7 +279,10 @@ impl fmt::Display for Value {
                 write!(f, "({body})")
             }
             Value::Quote(qid) => write!(f, "<quote:{}>", cid::to_hex(qid)),
-            Value::Token => write!(f, "<token>"),
+            Value::Token(domain) => match domain {
+                Some(d) => write!(f, "<{}>", types::token_tag_for_domain(*d).as_atom()),
+                None => write!(f, "<token>"),
+            },
         }
     }
 }
@@ -212,7 +304,15 @@ fn eval_node(
         bail!("object {} is not a node", cid::to_hex(node_cid));
     }
 
-    let has_token_out = out_types.first().map(|s| s == "token").unwrap_or(false);
+    let out_tags: Vec<TypeTag> = out_types
+        .iter()
+        .map(|atom| TypeTag::from_atom(atom))
+        .collect::<Result<Vec<_>>>()?;
+    let token_domains: Vec<Option<EffectDomain>> = out_tags
+        .iter()
+        .take_while(|tag| tag.is_token())
+        .map(|tag| tag.token_domain())
+        .collect();
 
     let mut inputs = eval_inputs(conn, &inputs_raw, cache, args)?;
 
@@ -223,31 +323,17 @@ fn eval_node(
         }
         1 => {
             let prim_cid = cbor_to_bytes32(&payload_val, "PRIM payload")?;
-            if has_token_out {
-                match inputs.pop() {
-                    Some(Value::Token) => {}
-                    _ => bail!("PRIM node missing token input"),
-                }
-            }
-            let mut outputs = Vec::new();
-            if has_token_out {
-                outputs.push(Value::Token);
-            }
+            consume_token_inputs(&mut inputs, &token_domains)?;
+            let mut outputs = token_values(&token_domains);
             outputs.push(eval_primitive(conn, &prim_cid, inputs)?);
+            validate_output_tokens(&outputs, &token_domains)?;
             outputs
         }
         2 => {
             let word_cid = cbor_to_bytes32(&payload_val, "CALL payload")?;
-            if has_token_out {
-                match inputs.pop() {
-                    Some(Value::Token) => {}
-                    _ => bail!("CALL node missing token input"),
-                }
-            }
-            let mut outputs = run_word(conn, &word_cid, &inputs)?;
-            if has_token_out {
-                outputs.insert(0, Value::Token);
-            }
+            consume_token_inputs(&mut inputs, &token_domains)?;
+            let outputs = run_word(conn, &word_cid, &inputs)?;
+            validate_output_tokens(&outputs, &token_domains)?;
             outputs
         }
         3 => {
@@ -281,7 +367,8 @@ fn eval_node(
         }
         9 => {
             let (qid, type_key) = cbor_to_apply_payload(&payload_val)?;
-            eval_apply(conn, &qid, type_key, &mut inputs)?
+            consume_token_inputs(&mut inputs, &token_domains)?;
+            eval_apply(conn, &qid, type_key, &mut inputs, &token_domains)?
         }
         10 => {
             if inputs_raw.len() != 1 {
@@ -310,7 +397,7 @@ fn eval_node(
             let result = eval_input(conn, branch, cache, args)?;
             vec![result]
         }
-        11 => vec![Value::Token],
+        11 => token_values(&token_domains),
         12 => {
             let (type_key, match_input, else_input) = cbor_to_guard_payload(&payload_val)?;
             let expected_tag = decode_guard_type_key(&type_key)?;
@@ -335,7 +422,7 @@ fn eval_return(
     root: &[u8; 32],
     cache: &mut HashMap<[u8; 32], Vec<Value>>,
     args: &[Value],
-    expected_results: &[TypeTag],
+    info: &crate::word::WordInfo,
 ) -> Result<Vec<Value>> {
     let (_, cbor) = load_object_cbor(conn, root)?;
     let NodeRecord(tag, kind_tag, _inputs_raw, _out_types, _effects_raw, payload_val) =
@@ -351,11 +438,13 @@ fn eval_return(
     }
 
     let (vals_raw, deps_raw) = cbor_to_return_payload(&payload_val)?;
-    if vals_raw.len() != expected_results.len() {
+    let token_domains = wrap_token_domains(&word_token_domains(info));
+    let expected_len = token_domains.len() + info.results.len();
+    if vals_raw.len() != expected_len {
         bail!(
-            "RETURN node value count {} does not match declared results {}",
+            "RETURN node value count {} does not match declared arity {} (tokens + results)",
             vals_raw.len(),
-            expected_results.len()
+            expected_len
         );
     }
 
@@ -368,6 +457,7 @@ fn eval_return(
         let value = eval_input(conn, input, cache, args)?;
         outputs.push(value);
     }
+    validate_output_tokens(&outputs, &token_domains)?;
     Ok(outputs)
 }
 
@@ -502,9 +592,12 @@ fn eval_apply(
     qid: &[u8; 32],
     _type_key: Option<[u8; 32]>,
     inputs: &mut Vec<Value>,
+    token_domains: &[Option<EffectDomain>],
 ) -> Result<Vec<Value>> {
     let args = std::mem::take(inputs);
-    run_word(conn, qid, &args)
+    let outputs = run_word(conn, qid, &args)?;
+    validate_output_tokens(&outputs, token_domains)?;
+    Ok(outputs)
 }
 
 fn value_to_i64(value: &Value) -> Result<i64> {
@@ -581,8 +674,9 @@ mod tests {
     use super::*;
     use crate::builder::GraphBuilder;
     use crate::node::{NodeCanon, NodeInput, NodeKind, NodePayload};
+    use crate::prim::{self, PrimCanon};
     use crate::store;
-    use crate::types::{TypeTag, effect_mask};
+    use crate::types::{EffectDomain, TypeTag, effect_mask};
 
     fn guard_key(tag: TypeTag) -> [u8; 32] {
         let mut bytes = [0u8; 32];
@@ -607,6 +701,41 @@ mod tests {
         assert_eq!(outputs.len(), 2);
         assert_eq!(outputs[0], Value::I64(1));
         assert_eq!(outputs[1], Value::I64(2));
+        Ok(())
+    }
+
+    #[test]
+    fn run_word_with_multiple_tokens() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        // Create a primitive that claims IO + State effects so we emit both tokens.
+        let params = [TypeTag::I64, TypeTag::I64];
+        let results = [TypeTag::I64];
+        let prim = PrimCanon {
+            params: &params,
+            results: &results,
+            effects: &[],
+            effect_mask: effect_mask::IO | effect_mask::STATE_READ,
+        };
+        let prim_outcome = prim::store_prim(&conn, &prim)?;
+        store::put_name(&conn, "prim", "add_i64", &prim_outcome.cid)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&params)?;
+        builder.apply_prim(prim_outcome.cid)?;
+        let word_cid = builder.finish_word(&params, &results, Some("demo/add_multi"))?;
+
+        let outputs = run_word(
+            &conn,
+            &word_cid,
+            &[Value::I64(1), Value::I64(2)],
+        )?;
+
+        assert_eq!(outputs.len(), 3);
+        assert_eq!(outputs[0], Value::Token(Some(EffectDomain::Io)));
+        assert_eq!(outputs[1], Value::Token(Some(EffectDomain::State)));
+        assert_eq!(outputs[2], Value::I64(3));
         Ok(())
     }
 

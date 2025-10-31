@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 use crate::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use crate::prim::{self, PrimInfo};
 use crate::store;
-use crate::types::{EffectMask, TypeTag, effect_mask, mask_has};
+use crate::types::{self, EffectDomain, EffectMask, TypeTag, effect_mask};
 use crate::word::{self, WordCanon, WordInfo};
 
 /// Stack items track the producer CID, output port, and type.
@@ -26,13 +26,8 @@ struct StackItem {
     ty: TypeTag,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum TokenDomain {
-    Io,
-}
-
 struct TokenPool {
-    map: HashMap<TokenDomain, NodeInput>,
+    map: HashMap<EffectDomain, NodeInput>,
 }
 
 impl TokenPool {
@@ -46,11 +41,11 @@ impl TokenPool {
         self.map.clear();
     }
 
-    fn current(&self, domain: TokenDomain) -> Option<NodeInput> {
+    fn current(&self, domain: EffectDomain) -> Option<NodeInput> {
         self.map.get(&domain).copied()
     }
 
-    fn update(&mut self, domain: TokenDomain, token: NodeInput) {
+    fn update(&mut self, domain: EffectDomain, token: NodeInput) {
         self.map.insert(domain, token);
     }
 }
@@ -65,6 +60,7 @@ pub struct GraphBuilder<'conn> {
     accumulated_effects: Vec<[u8; 32]>,
     effect_frontier: BTreeMap<[u8; 32], NodeInput>,
     token_pool: TokenPool,
+    accumulated_mask: EffectMask,
 }
 
 impl<'conn> GraphBuilder<'conn> {
@@ -79,6 +75,7 @@ impl<'conn> GraphBuilder<'conn> {
             accumulated_effects: Vec::new(),
             effect_frontier: BTreeMap::new(),
             token_pool: TokenPool::new(),
+            accumulated_mask: effect_mask::NONE,
         }
     }
 
@@ -137,6 +134,7 @@ impl<'conn> GraphBuilder<'conn> {
         self.accumulated_effects.clear();
         self.effect_frontier.clear();
         self.token_pool.clear();
+        self.accumulated_mask = effect_mask::NONE;
 
         for (idx, ty) in params.iter().enumerate() {
             let node = NodeCanon {
@@ -390,25 +388,16 @@ impl<'conn> GraphBuilder<'conn> {
             })
             .collect();
 
-        let mut effect_mask = effect_mask;
-        if effect_mask == effect_mask::NONE && !effects.is_empty() {
-            effect_mask = effect_mask::IO;
+        let mut mask_value = effect_mask;
+        if mask_value == effect_mask::NONE && !effects.is_empty() {
+            mask_value = effect_mask::IO;
         }
-
-        let emits_token = effect_mask != effect_mask::NONE
-            && matches!(
-                payload,
-                NodePayload::Prim(_) | NodePayload::Word(_) | NodePayload::Apply { .. }
-            );
-        let token_domain = if mask_has(effect_mask, effect_mask::IO) {
-            TokenDomain::Io
-        } else {
-            TokenDomain::Io
-        };
-        if emits_token {
-            let token_in = self.ensure_domain_token(token_domain)?;
+        let domains = types::effect_domains(mask_value);
+        for domain in &domains {
+            let token_in = self.ensure_domain_token(*domain)?;
             inputs_vec.push(token_in);
         }
+        let emits_token = !domains.is_empty();
 
         let kind = match &payload {
             NodePayload::Prim(..) => NodeKind::Prim,
@@ -420,10 +409,13 @@ impl<'conn> GraphBuilder<'conn> {
             _ => unreachable!("apply_general: unsupported payload"),
         };
 
-        let mut out_atoms: Vec<String> = results.iter().map(|t| t.as_atom().to_string()).collect();
+        let mut out_atoms: Vec<String> = Vec::with_capacity(domains.len() + results.len());
         if emits_token {
-            out_atoms.insert(0, TypeTag::Token.as_atom().to_string());
+            for domain in &domains {
+                out_atoms.push(types::token_tag_for_domain(*domain).as_atom().to_string());
+            }
         }
+        out_atoms.extend(results.iter().map(|t| t.as_atom().to_string()));
 
         let node = NodeCanon {
             kind,
@@ -437,18 +429,27 @@ impl<'conn> GraphBuilder<'conn> {
 
         let outcome = node::store_node(self.conn, &node)?;
         self.accumulated_effects.extend(effects.iter().copied());
+        self.accumulated_mask |= mask_value;
 
         let mut data_port_offset = 0u32;
         if emits_token {
-            let token_out = NodeInput {
-                cid: outcome.cid,
-                port: 0,
-            };
-            self.token_pool.update(token_domain, token_out);
-            for effect in effects {
-                self.effect_frontier.insert(*effect, token_out);
+            let mut first_token: Option<NodeInput> = None;
+            for (idx, domain) in domains.iter().enumerate() {
+                let token_out = NodeInput {
+                    cid: outcome.cid,
+                    port: idx as u32,
+                };
+                if first_token.is_none() {
+                    first_token = Some(token_out);
+                }
+                self.token_pool.update(*domain, token_out);
             }
-            data_port_offset = 1;
+            if let Some(token_out) = first_token {
+                for effect in effects {
+                    self.effect_frontier.insert(*effect, token_out);
+                }
+            }
+            data_port_offset = domains.len() as u32;
         }
 
         for (idx, ty) in results.iter().copied().enumerate() {
@@ -539,9 +540,7 @@ impl<'conn> GraphBuilder<'conn> {
             );
         }
 
-        let has_effects = !self.accumulated_effects.is_empty();
-
-        let mut vals = Vec::with_capacity(results.len() + if has_effects { 1 } else { 0 });
+        let mut vals = Vec::with_capacity(results.len());
         for (idx, expected) in results.iter().enumerate() {
             let item = self
                 .stack
@@ -562,12 +561,22 @@ impl<'conn> GraphBuilder<'conn> {
         }
         vals.reverse();
 
-        if has_effects {
-            let token = self
-                .token_pool
-                .current(TokenDomain::Io)
-                .ok_or_else(|| anyhow!("effectful word missing token output"))?;
-            vals.insert(0, token);
+        let mut mask = self.accumulated_mask;
+        if mask == effect_mask::NONE && !self.accumulated_effects.is_empty() {
+            mask = effect_mask::IO;
+        }
+        let domains = types::effect_domains(mask);
+        if !domains.is_empty() {
+            let mut prefixed = Vec::with_capacity(domains.len() + vals.len());
+            for domain in &domains {
+                let token = self
+                    .token_pool
+                    .current(*domain)
+                    .ok_or_else(|| anyhow!("effectful word missing token output"))?;
+                prefixed.push(token);
+            }
+            prefixed.extend(vals.into_iter());
+            vals = prefixed;
         }
 
         let mut deps: Vec<NodeInput> = self.effect_frontier.values().copied().collect();
@@ -581,15 +590,11 @@ impl<'conn> GraphBuilder<'conn> {
         self.accumulated_effects.dedup();
 
         let mut return_out_types = Vec::new();
-        if has_effects {
-            return_out_types.push(TypeTag::Token.as_atom().to_string());
+        for domain in &domains {
+            return_out_types.push(types::token_tag_for_domain(*domain).as_atom().to_string());
         }
         return_out_types.extend(results.iter().map(|t| t.as_atom().to_string()));
-        let word_effect_mask = if has_effects {
-            effect_mask::IO
-        } else {
-            effect_mask::NONE
-        };
+        let word_effect_mask = mask;
 
         let return_node = NodeCanon {
             kind: NodeKind::Return,
@@ -619,6 +624,7 @@ impl<'conn> GraphBuilder<'conn> {
         self.accumulated_effects.clear();
         self.effect_frontier.clear();
         self.token_pool.clear();
+        self.accumulated_mask = effect_mask::NONE;
         Ok(outcome.cid)
     }
 
@@ -640,12 +646,12 @@ impl<'conn> GraphBuilder<'conn> {
         Ok(out)
     }
 
-    fn ensure_domain_token(&mut self, domain: TokenDomain) -> Result<NodeInput> {
+    fn ensure_domain_token(&mut self, domain: EffectDomain) -> Result<NodeInput> {
         if let Some(token) = self.token_pool.current(domain) {
             return Ok(token);
         }
 
-        let token_ty = TypeTag::Token;
+        let token_ty = types::token_tag_for_domain(domain);
         let node = NodeCanon {
             kind: NodeKind::Token,
             out: vec![token_ty.as_atom().to_string()],

@@ -28,7 +28,7 @@ pub struct WordStoreOutcome {
 /// Encode a word into canonical CBOR.
 pub fn encode(word: &WordCanon) -> Vec<u8> {
     let mut buf = Vec::new();
-    push_array(&mut buf, 5);
+    push_array(&mut buf, 6);
     crate::cbor::push_u32(&mut buf, 1); // object tag for "word"
     push_bytes(&mut buf, &word.root);
 
@@ -48,6 +48,8 @@ pub fn encode(word: &WordCanon) -> Vec<u8> {
     for effect in sorted_effects {
         push_bytes(&mut buf, &effect);
     }
+
+    crate::cbor::push_u32(&mut buf, word.effect_mask);
 
     buf
 }
@@ -77,7 +79,7 @@ pub fn load_word_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<WordInf
         [cid_bytes.as_slice()],
         |row| row.get(0),
     )?;
-    let WordRecord(tag, root_buf, params_raw, results_raw, effects_raw) =
+    let WordRecord(tag, root_buf, params_raw, results_raw, effects_raw, mask_opt) =
         serde_cbor::from_slice(&cbor)?;
     if tag != 1 {
         bail!("object tag mismatch while loading word: {tag}");
@@ -103,11 +105,11 @@ pub fn load_word_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<WordInf
             Ok(arr)
         })
         .collect::<Result<Vec<_>>>()?;
-    let effect_mask_value = if effects.is_empty() {
+    let effect_mask_value = mask_opt.unwrap_or(if effects.is_empty() {
         effect_mask::NONE
     } else {
         effect_mask::IO
-    };
+    });
     Ok(WordInfo {
         root,
         params,
@@ -128,7 +130,14 @@ fn bytebuf_to_array(buf: &ByteBuf) -> Result<[u8; 32]> {
 }
 
 #[derive(Deserialize)]
-struct WordRecord(u64, ByteBuf, Vec<String>, Vec<String>, Vec<ByteBuf>);
+struct WordRecord(
+    u64,
+    ByteBuf,
+    Vec<String>,
+    Vec<String>,
+    Vec<ByteBuf>,
+    #[serde(default)] Option<u32>,
+);
 
 #[cfg(test)]
 mod tests {
@@ -149,9 +158,10 @@ mod tests {
             serde_cbor::from_slice(&encoded).expect("valid CBOR encoding");
         match value {
             serde_cbor::Value::Array(items) => {
-                assert_eq!(items.len(), 5);
+                assert_eq!(items.len(), 6);
                 assert_eq!(items[0], serde_cbor::Value::Integer(1));
                 assert!(matches!(items[1], serde_cbor::Value::Bytes(_)));
+                assert_eq!(items[5], serde_cbor::Value::Integer(0));
             }
             other => panic!("expected array, got {other:?}"),
         }
@@ -167,7 +177,7 @@ mod tests {
             params: vec!["i64".to_string()],
             results: vec!["i64".to_string()],
             effects: vec![[0xAA; 32]],
-            effect_mask: effect_mask::IO,
+            effect_mask: effect_mask::STATE_READ,
         };
         let outcome = store_word(&conn, &word)?;
         let info = load_word_info(&conn, &outcome.cid)?;
@@ -176,7 +186,7 @@ mod tests {
         assert_eq!(info.results, vec![TypeTag::I64]);
         assert_eq!(info.effects.len(), 1);
         assert_eq!(info.effects[0], [0xAA; 32]);
-        assert_eq!(info.effect_mask, effect_mask::IO);
+        assert_eq!(info.effect_mask, effect_mask::STATE_READ);
         Ok(())
     }
 }

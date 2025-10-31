@@ -2,11 +2,11 @@
 
 ## Now (unblock drift from design docs)
 
-- **Document current CLI contracts**: capture argument formats for `iface add`, `namespace add`, and token-handling expectations in `README.md` to prevent misuse while encoders are in flux.
+- **Bootstrap global state backend**: stand up a mutable global store (even if backed by an in-memory stub), add state read/write prims, and route the new `State` tokens through it so the multi-domain token plumbing exercises real data flow.
+
+- ✅ **Generalised token pooling** (2025-03-05): interpreter/builder now emit per-domain tokens; added regression coverage for mixed IO+State words.
 
 ## Next (extend capability model)
-
-- **Generalise token pooling**: introduce multiple `TokenDomain` entries (state, fs, net, test) and wire them through `GraphBuilder`, interpreter, and word metadata so we can exercise the split-token designs from DESIGN-IV/V.
 
 - **Implement context guards**: flesh out `GUARDCTX` lowering and interpreter handling, allowing overload dispatch based on runtime predicates and contexts.
 
