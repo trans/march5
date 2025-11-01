@@ -147,6 +147,7 @@ mod tests {
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: effects.clone(),
             effect_mask: effect_mask::IO,
+            guards: Vec::new(),
         };
         let outcome = store_word(&conn, &word)?;
         let iface = derive_from_exports(&conn, &[("add".into(), outcome.cid)])?;

@@ -1,22 +1,23 @@
 # March α₅ Project Progress
 
 ## Snapshot
-- `cargo test` passes locally (2025-10-28) with 34 core unit tests plus CLI/webui smoke checks.
-- Working tree tracked on branch `main`; recent focus is on canonical encodings, stack builder, and CLI tooling.
+- `cargo test` passes locally (2025-03-05) with 47 core unit tests plus CLI/webui smoke checks (offline mode).
+- Working tree tracked on branch `main`; recent focus is on guard support, YAML tooling, and boolean predicate primitives.
 
 ## Implemented Capabilities
 - **Object encoding & storage**: canonical CBOR emitters exist for primitives, nodes (including `RETURN`/multi-result support), words, interfaces, and namespaces; persisted through SQLite (`src/store.rs`).
-- **CLI tooling**: binary in `src/main.rs` supports `new`, `effect`, `prim`, `iface`, `namespace`, `node`, `word`, `builder`, and `run` subcommands with test coverage (`src/main.rs`).
-- **Graph builder**: `GraphBuilder` (`src/builder.rs`) assembles graphs from a Forth-like stack machine, tracks IO tokens/effects, emits `RETURN` nodes, and registers words in the name index.
-- **Interpreter & exec stubs**: `run_word` in `src/interp.rs` evaluates graphs (including guards, APPLY nodes, and token threading); `src/exec.rs` contains a minimal JIT stub for add/sub primitives.
+- **CLI tooling**: binary in `src/main.rs` supports `new`, `effect`, `prim`, `iface`, `namespace`, `node`, `word`, `builder`, `run`, and `catalog` subcommands; YAML loaders power `run --args-yaml` and catalog import with regression coverage.
+- **Graph builder**: `GraphBuilder` (`src/builder.rs`) assembles graphs from a Forth-like stack machine, tracks effect-domain tokens, emits `RETURN` nodes, attaches guard quotations, and registers words in the name index.
+- **Guard quotations & predicates**: guards compile to pure quotations with stored CIDs, the interpreter runs them transactionally before word bodies, and boolean/comparison primitives (`eq_i64`, `gt_i64`, `and`, `or`, `not`, etc.) are available for guard logic.
+- **Interpreter & exec stubs**: `run_word` in `src/interp.rs` evaluates graphs (including catalog-authored guards, APPLY nodes, and token threading); `src/exec.rs` contains a minimal JIT stub for add/sub primitives.
 - **Web UI**: `src/bin/webui.rs` serves HTML + JSON views over objects stored in a March database.
 
 ## Known Gaps & Divergences
 - Interface encoding currently serialises under the `names` key with per-symbol maps; the design documents expect a `symbols` array with positional fields.
-- Effect handling is restricted to a single IO token (`TokenDomain::Io`); state/fs/net/test domains and R/W split tokens from DESIGN-IV/V are not implemented.
+- Guard lowering into Mini-INet dispatch (parallel reduction, overload search) remains to be implemented; current runtime evaluates guard quotations sequentially ahead of the body.
 - Effect masks collapse to `effect_mask::IO`; other bit flags exist in `src/types.rs` but have no integration.
 - Namespace imports encode raw interface CIDs but do not retain alias metadata (`use` sugar) as noted in DESIGN-II (expected, but flag for future ergonomic layers).
-- Context dispatch, transactions, durability policies, and token pools described in DESIGN-IV/V remain to be prototyped beyond placeholder node kinds.
+- Context dispatch, transactions, durability policies, and richer token pools described in DESIGN-IV/V remain to be prototyped beyond placeholder node kinds.
 - `RETURN`/multi-output encoding is in place; legacy `ty` fields have been removed.
 
 ## Artifacts & Data

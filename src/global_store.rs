@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 
 use anyhow::{Result, anyhow, bail};
-use std::convert::TryFrom;
 use once_cell::sync::Lazy;
 use rusqlite::Connection;
 use serde_cbor::Value as CborValue;
+use std::convert::TryFrom;
 
 use crate::cbor::{push_array, push_bytes, push_f64, push_i64, push_text, push_u32};
 use crate::interp::Value;
@@ -124,7 +124,10 @@ pub fn encode_snapshot(snapshot: &GlobalStoreSnapshot) -> Result<Vec<u8>> {
 }
 
 /// Persist the snapshot in the canonical object store.
-pub fn store_snapshot(conn: &Connection, snapshot: &GlobalStoreSnapshot) -> Result<GlobalStoreStoreOutcome> {
+pub fn store_snapshot(
+    conn: &Connection,
+    snapshot: &GlobalStoreSnapshot,
+) -> Result<GlobalStoreStoreOutcome> {
     let cbor = encode_snapshot(snapshot)?;
     let cid = cid::compute(&cbor);
     let inserted = store::put_object(conn, &cid, "gstate", &cbor)?;
@@ -135,7 +138,10 @@ pub fn store_snapshot(conn: &Connection, snapshot: &GlobalStoreSnapshot) -> Resu
 pub fn load_snapshot(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<GlobalStoreSnapshot> {
     let (kind, cbor) = store::load_object_cbor(conn, cid_bytes)?;
     if kind != "gstate" {
-        bail!("object {} is not a global store snapshot", cid::to_hex(cid_bytes));
+        bail!(
+            "object {} is not a global store snapshot",
+            cid::to_hex(cid_bytes)
+        );
     }
     let value: CborValue = serde_cbor::from_slice(&cbor)?;
     decode_snapshot(&value)
@@ -187,7 +193,10 @@ fn encode_store_value(buf: &mut Vec<u8>, value: &Value) -> Result<()> {
             push_text(buf, s);
             Ok(())
         }
-        other => bail!("unsupported value type in global store snapshot: {:?}", other),
+        other => bail!(
+            "unsupported value type in global store snapshot: {:?}",
+            other
+        ),
     }
 }
 
@@ -239,7 +248,8 @@ fn decode_store_value(value: &CborValue) -> Result<Value> {
                     }
                     match &items[1] {
                         CborValue::Integer(n) => {
-                            let value = i64::try_from(*n).map_err(|_| anyhow!("i64 payload out of range"))?;
+                            let value = i64::try_from(*n)
+                                .map_err(|_| anyhow!("i64 payload out of range"))?;
                             Ok(Value::I64(value))
                         }
                         other => bail!("i64 payload must be integer, found {other:?}"),
@@ -337,7 +347,10 @@ mod tests {
             Some(&Value::Tuple(vec![Value::I64(1), Value::F64(2.5)]))
         );
         assert_eq!(map.get("demo/quote"), Some(&Value::Quote(quote_cid)));
-        assert_eq!(map.get("demo/text"), Some(&Value::Text("hello".to_string())));
+        assert_eq!(
+            map.get("demo/text"),
+            Some(&Value::Text("hello".to_string()))
+        );
         Ok(())
     }
 
@@ -348,7 +361,10 @@ mod tests {
         reset();
         write("demo.item", Value::I64(7));
         write("demo.float", Value::F64(2.5));
-        write("demo.tuple", Value::Tuple(vec![Value::I64(4), Value::I64(5)]));
+        write(
+            "demo.tuple",
+            Value::Tuple(vec![Value::I64(4), Value::I64(5)]),
+        );
         let quote_cid = [0x11; 32];
         write("demo.quote", Value::Quote(quote_cid));
         write("demo.text", Value::Text("store".to_string()));

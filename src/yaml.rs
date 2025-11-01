@@ -53,12 +53,12 @@ fn parse_node(lines: &[Line<'_>], idx: &mut usize, indent: usize) -> Result<Node
             parse_mapping(lines, idx, indent)
         } else {
             // check if colon is part of scalar (e.g., "http://")
-        let (_key, remainder) = line.content.split_at(pos);
-        if remainder.starts_with("://") {
-            parse_scalar_node(lines, idx, indent)
-        } else {
-            parse_mapping(lines, idx, indent)
-        }
+            let (_key, remainder) = line.content.split_at(pos);
+            if remainder.starts_with("://") {
+                parse_scalar_node(lines, idx, indent)
+            } else {
+                parse_mapping(lines, idx, indent)
+            }
         }
     } else {
         parse_scalar_node(lines, idx, indent)
@@ -173,7 +173,11 @@ fn parse_inline_sequence(text: &str) -> Option<Vec<Node>> {
             // treat inline tag without payload as scalar tagged later
             let mut parts = rest.splitn(2, char::is_whitespace);
             let tag = parts.next().unwrap().to_string();
-            let remainder = parts.next().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("{}");
+            let remainder = parts
+                .next()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("{}");
             let inner = if remainder == "{}" {
                 Node::Scalar(String::new())
             } else if let Some(seq) = parse_inline_sequence(remainder) {
@@ -192,11 +196,7 @@ fn parse_inline_sequence(text: &str) -> Option<Vec<Node>> {
     Some(items)
 }
 
-fn parse_scalar_node(
-    lines: &[Line<'_>],
-    idx: &mut usize,
-    _indent: usize,
-) -> Result<Node> {
+fn parse_scalar_node(lines: &[Line<'_>], idx: &mut usize, _indent: usize) -> Result<Node> {
     let content = lines[*idx].content;
     *idx += 1;
     parse_tag_or_scalar(lines, idx, _indent, content)
@@ -211,8 +211,12 @@ fn decode_hex(input: &str) -> Result<Vec<u8>> {
     let mut chars = trimmed.chars();
     while let Some(high) = chars.next() {
         let low = chars.next().unwrap();
-        let hi = high.to_digit(16).ok_or_else(|| anyhow!("invalid hex char `{high}`"))?;
-        let lo = low.to_digit(16).ok_or_else(|| anyhow!("invalid hex char `{low}`"))?;
+        let hi = high
+            .to_digit(16)
+            .ok_or_else(|| anyhow!("invalid hex char `{high}`"))?;
+        let lo = low
+            .to_digit(16)
+            .ok_or_else(|| anyhow!("invalid hex char `{low}`"))?;
         bytes.push(((hi << 4) | lo) as u8);
     }
     Ok(bytes)
@@ -340,7 +344,9 @@ fn as_scalar(node: &Node) -> Result<String> {
 /// Representation of a catalog entry loaded from YAML.
 #[derive(Debug)]
 pub enum CatalogItem {
-    Effect { doc: Option<String> },
+    Effect {
+        doc: Option<String>,
+    },
     Prim {
         params: Vec<TypeTag>,
         results: Vec<TypeTag>,
@@ -348,6 +354,12 @@ pub enum CatalogItem {
         emask: Vec<String>,
     },
     Word {
+        params: Vec<TypeTag>,
+        results: Vec<TypeTag>,
+        stack: Vec<WordOp>,
+        guards: Vec<String>,
+    },
+    Guard {
         params: Vec<TypeTag>,
         results: Vec<TypeTag>,
         stack: Vec<WordOp>,
@@ -409,10 +421,14 @@ fn decode_catalog_entry(symbol: &str, node: Node) -> Result<CatalogItem> {
             "effect" => decode_effect_entry(*value),
             "prim" => decode_prim_entry(*value),
             "word" => decode_word_entry(symbol, *value),
+            "guard" => decode_guard_entry(symbol, *value),
             "snapshot" => decode_snapshot_entry(*value),
             other => bail!("unsupported catalog tag `{other}`"),
         },
-        other => bail!("catalog entry `{symbol}` must use tagged form, found {:?}", other),
+        other => bail!(
+            "catalog entry `{symbol}` must use tagged form, found {:?}",
+            other
+        ),
     }
 }
 
@@ -465,7 +481,30 @@ fn decode_word_entry(symbol: &str, node: Node) -> Result<CatalogItem> {
         .get("stack")
         .ok_or_else(|| anyhow!("word `{symbol}` missing `stack` field"))?;
     let ops = decode_word_ops(stack_node)?;
+    let guards = parse_string_list(map.get("guards"))?;
     Ok(CatalogItem::Word {
+        params,
+        results,
+        stack: ops,
+        guards,
+    })
+}
+
+fn decode_guard_entry(symbol: &str, node: Node) -> Result<CatalogItem> {
+    let map = match node {
+        Node::Mapping(map) => map,
+        other => bail!("guard entry `{symbol}` must be mapping, found {:?}", other),
+    };
+    let params = parse_type_list(map.get("params"))?;
+    let mut results = parse_type_list(map.get("results"))?;
+    if results.is_empty() {
+        results.push(TypeTag::I64);
+    }
+    let stack_node = map
+        .get("stack")
+        .ok_or_else(|| anyhow!("guard `{symbol}` missing `stack` field"))?;
+    let ops = decode_word_ops(stack_node)?;
+    Ok(CatalogItem::Guard {
         params,
         results,
         stack: ops,
@@ -517,6 +556,17 @@ fn parse_hex_list(node: Option<&Node>) -> Result<Vec<[u8; 32]>> {
             Ok(out)
         }
         Some(other) => bail!("effects list must be sequence, found {:?}", other),
+    }
+}
+
+fn parse_string_list(node: Option<&Node>) -> Result<Vec<String>> {
+    match node {
+        None => Ok(Vec::new()),
+        Some(Node::Sequence(items)) => items
+            .iter()
+            .map(|item| as_scalar(item))
+            .collect::<Result<Vec<_>>>(),
+        Some(other) => bail!("string list must be sequence, found {:?}", other),
     }
 }
 
@@ -599,6 +649,11 @@ core:
     params: [i64, i64]
     results: [i64]
 demo:
+  always_true: !guard
+    params: []
+    results: [i64]
+    stack:
+      - !lit -1
   counter: !snapshot
     demo.counter: !i64 0
   square: !word
@@ -610,6 +665,11 @@ demo:
 "#;
         let catalog = parse_catalog_from_str(doc)?;
         assert_eq!(catalog.len(), 2);
+        let demo_entries = catalog.get("demo").expect("demo namespace parsed");
+        assert!(matches!(
+            demo_entries.get("always_true"),
+            Some(CatalogItem::Guard { .. })
+        ));
         Ok(())
     }
 }

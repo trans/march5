@@ -12,6 +12,7 @@ use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
 use smallvec::SmallVec;
 
+use crate::guard;
 use crate::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use crate::prim::{self, PrimInfo};
 use crate::store;
@@ -36,7 +37,6 @@ impl TokenPool {
             map: HashMap::new(),
         }
     }
-
     fn clear(&mut self) {
         self.map.clear();
     }
@@ -61,6 +61,7 @@ pub struct GraphBuilder<'conn> {
     effect_frontier: BTreeMap<[u8; 32], NodeInput>,
     token_pool: TokenPool,
     accumulated_mask: EffectMask,
+    attached_guards: Vec<[u8; 32]>,
 }
 
 impl<'conn> GraphBuilder<'conn> {
@@ -76,6 +77,7 @@ impl<'conn> GraphBuilder<'conn> {
             effect_frontier: BTreeMap::new(),
             token_pool: TokenPool::new(),
             accumulated_mask: effect_mask::NONE,
+            attached_guards: Vec::new(),
         }
     }
 
@@ -135,6 +137,7 @@ impl<'conn> GraphBuilder<'conn> {
         self.effect_frontier.clear();
         self.token_pool.clear();
         self.accumulated_mask = effect_mask::NONE;
+        self.attached_guards.clear();
 
         for (idx, ty) in params.iter().enumerate() {
             let node = NodeCanon {
@@ -157,9 +160,106 @@ impl<'conn> GraphBuilder<'conn> {
         Ok(())
     }
 
+    /// Start building a guard quotation with the given parameters.
+    pub fn begin_guard(&mut self, params: &[TypeTag]) -> Result<()> {
+        self.begin_word(params)
+    }
+
     /// Current stack depth (number of available outputs).
     pub fn depth(&self) -> usize {
         self.stack.len()
+    }
+
+    /// Attach a guard CID to the word currently being built.
+    pub fn attach_guard(&mut self, guard_cid: [u8; 32]) {
+        if !self.attached_guards.contains(&guard_cid) {
+            self.attached_guards.push(guard_cid);
+        }
+    }
+
+    /// Finish a guard quotation, ensuring purity and boolean result.
+    pub fn finish_guard(
+        &mut self,
+        params: &[TypeTag],
+        results: &[TypeTag],
+        symbol: Option<&str>,
+    ) -> Result<[u8; 32]> {
+        if params != self.param_types {
+            bail!(
+                "guard parameters changed mid-build: began with {:?}, finishing with {:?}",
+                self.param_types,
+                params
+            );
+        }
+        if !self.accumulated_effects.is_empty() || self.accumulated_mask != effect_mask::NONE {
+            bail!("guard cannot declare effects or effect masks (guards must be pure)");
+        }
+        if !self.effect_frontier.is_empty() {
+            bail!("guard cannot have effect dependencies");
+        }
+        if results.len() != 1 || results[0] != TypeTag::I64 {
+            bail!("guard must return exactly one i64 result");
+        }
+        if self.stack.len() != results.len() {
+            bail!(
+                "guard must leave exactly {} result(s); stack has {}",
+                results.len(),
+                self.stack.len()
+            );
+        }
+
+        let mut vals = Vec::with_capacity(results.len());
+        for (idx, expected) in results.iter().enumerate() {
+            let item = self
+                .stack
+                .get(self.stack.len() - 1 - idx)
+                .ok_or_else(|| anyhow!("stack underflow while collecting guard results"))?;
+            if item.ty != *expected {
+                bail!(
+                    "guard result {} type mismatch: expected {:?}, got {:?}",
+                    idx,
+                    expected,
+                    item.ty
+                );
+            }
+            vals.push(NodeInput {
+                cid: item.cid,
+                port: item.port,
+            });
+        }
+        vals.reverse();
+
+        let return_node = NodeCanon {
+            kind: NodeKind::Return,
+            out: results.iter().map(|t| t.as_atom().to_string()).collect(),
+            inputs: Vec::new(),
+            vals,
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Return,
+        };
+        let return_outcome = node::store_node(self.conn, &return_node)?;
+
+        let guard = guard::GuardCanon {
+            root: return_outcome.cid,
+            params: params.iter().map(|t| t.as_atom().to_string()).collect(),
+            results: results.iter().map(|t| t.as_atom().to_string()).collect(),
+            effects: Vec::new(),
+            effect_mask: effect_mask::NONE,
+        };
+        let outcome = guard::store_guard(self.conn, &guard)?;
+        if let Some(name) = symbol {
+            store::put_name(self.conn, "guard", name, &outcome.cid)?;
+        }
+
+        self.param_types.clear();
+        self.stack.clear();
+        self.accumulated_effects.clear();
+        self.effect_frontier.clear();
+        self.token_pool.clear();
+        self.accumulated_mask = effect_mask::NONE;
+        self.attached_guards.clear();
+        Ok(outcome.cid)
     }
 
     /// Push a literal i64 node on the stack.
@@ -589,6 +689,10 @@ impl<'conn> GraphBuilder<'conn> {
         self.accumulated_effects.sort_unstable();
         self.accumulated_effects.dedup();
 
+        let mut guard_list = self.attached_guards.clone();
+        guard_list.sort();
+        guard_list.dedup();
+
         let mut return_out_types = Vec::new();
         for domain in &domains {
             return_out_types.push(types::token_tag_for_domain(*domain).as_atom().to_string());
@@ -613,6 +717,7 @@ impl<'conn> GraphBuilder<'conn> {
             results: results.iter().map(|t| t.as_atom().to_string()).collect(),
             effects: self.accumulated_effects.clone(),
             effect_mask: word_effect_mask,
+            guards: guard_list,
         };
         let outcome = word::store_word(self.conn, &word)?;
         if let Some(name) = symbol {
@@ -625,6 +730,7 @@ impl<'conn> GraphBuilder<'conn> {
         self.effect_frontier.clear();
         self.token_pool.clear();
         self.accumulated_mask = effect_mask::NONE;
+        self.attached_guards.clear();
         Ok(outcome.cid)
     }
 
@@ -1000,6 +1106,23 @@ mod tests {
 
         let outputs = run_word(&conn, &caller_cid, &[])?;
         assert_eq!(outputs, vec![Value::I64(7)]);
+        Ok(())
+    }
+
+    #[test]
+    fn finish_guard_persists_boolean_guard() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_guard(&[])?;
+        builder.push_lit_i64(-1)?;
+        let guard_cid = builder.finish_guard(&[], &[TypeTag::I64], Some("demo/guard"))?;
+
+        let guard_info = crate::guard::load_guard_info(&conn, &guard_cid)?;
+        assert_eq!(guard_info.results, vec![TypeTag::I64]);
+        assert!(guard_info.effects.is_empty());
+        assert_eq!(guard_info.effect_mask, effect_mask::NONE);
         Ok(())
     }
 }

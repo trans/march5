@@ -10,9 +10,11 @@
 
 - ✅ **Generalised token pooling** (2025-03-05): interpreter/builder now emit per-domain tokens; added regression coverage for mixed IO+State words.
 
+- ✅ **Guard quotations (stage 1)** (2025-03-05): guards compile as pure quotations, builder attaches guard CIDs, interpreter runs them transactionally before word bodies, and YAML/CLI workflows persist and attach them.
+
 ## Next (extend capability model)
 
-- **Implement context guards**: flesh out `GUARDCTX` lowering and interpreter handling, allowing overload dispatch based on runtime predicates and contexts.
+- **Guard lowering (stage 2)**: fold guard graphs into overload Mini‑Inet dispatch so predicates participate in parallel reduction once the dispatcher scaffolding is ready; reuse the stored guard CIDs from stage 1.
 
 - **Transaction scaffolding**: add node kinds and builder helpers for `TXN_BEGIN/COMMIT/ABORT`, threading transaction IDs through the token pool and effect frontier.
 

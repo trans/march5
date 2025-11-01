@@ -11,6 +11,7 @@ use std::fmt;
 
 use crate::exec::{compiled_add, compiled_sub};
 use crate::global_store;
+use crate::guard;
 use crate::prim::load_prim_info;
 use crate::types::{self, EffectDomain, EffectMask, TypeTag, effect_mask};
 use crate::word::load_word_info;
@@ -59,6 +60,81 @@ pub fn run_word(conn: &Connection, word_cid: &[u8; 32], args: &[Value]) -> Resul
     run_word_with_info(conn, &info, args)
 }
 
+fn evaluate_guards(conn: &Connection, info: &crate::word::WordInfo, args: &[Value]) -> Result<()> {
+    for guard_cid in &info.guards {
+        if !run_guard(conn, guard_cid, args)? {
+            bail!(
+                "guard {} failed for word {}",
+                cid::to_hex(guard_cid),
+                cid::to_hex(&info.root)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_guard(conn: &Connection, guard_cid: &[u8; 32], args: &[Value]) -> Result<bool> {
+    let info = guard::load_guard_info(conn, guard_cid)?;
+    if info.params.len() > args.len() {
+        bail!(
+            "guard {} expects at least {} argument(s), provided {}",
+            cid::to_hex(guard_cid),
+            info.params.len(),
+            args.len()
+        );
+    }
+    let guard_args = &args[..info.params.len()];
+    for (idx, (expected, actual)) in info.params.iter().zip(guard_args.iter()).enumerate() {
+        if *expected != actual.type_tag() {
+            bail!(
+                "guard {} argument {idx} type mismatch: expected {:?}, got {:?}",
+                cid::to_hex(guard_cid),
+                expected,
+                actual.type_tag()
+            );
+        }
+    }
+    if !info.effects.is_empty() || info.effect_mask != effect_mask::NONE {
+        bail!(
+            "guard {} declares side effects; guards must be pure",
+            cid::to_hex(guard_cid)
+        );
+    }
+    if info.results.len() != 1 || info.results[0] != TypeTag::I64 {
+        bail!(
+            "guard {} must return a single i64 result",
+            cid::to_hex(guard_cid)
+        );
+    }
+
+    let mut cache: HashMap<[u8; 32], Vec<Value>> = HashMap::new();
+    let arg_clone = guard_args.to_vec();
+    let word_like = crate::word::WordInfo {
+        root: info.root,
+        params: info.params.clone(),
+        results: info.results.clone(),
+        effects: info.effects.clone(),
+        effect_mask: info.effect_mask,
+        guards: Vec::new(),
+    };
+    let outputs = eval_return(conn, &info.root, &mut cache, &arg_clone, &word_like)?;
+    if outputs.len() != 1 {
+        bail!(
+            "guard {} returned {} value(s)",
+            cid::to_hex(guard_cid),
+            outputs.len()
+        );
+    }
+    match &outputs[0] {
+        Value::I64(n) => Ok(*n != 0),
+        other => bail!(
+            "guard {} produced non-i64 result {:?}",
+            cid::to_hex(guard_cid),
+            other.type_tag()
+        ),
+    }
+}
+
 fn normalize_effect_mask(mask: EffectMask, has_effects: bool) -> EffectMask {
     if mask == effect_mask::NONE && has_effects {
         effect_mask::IO
@@ -77,20 +153,14 @@ fn word_token_domains(info: &crate::word::WordInfo) -> SmallVec<[EffectDomain; 4
 }
 
 fn token_values(domains: &[Option<EffectDomain>]) -> Vec<Value> {
-    domains
-        .iter()
-        .map(|domain| Value::Token(*domain))
-        .collect()
+    domains.iter().map(|domain| Value::Token(*domain)).collect()
 }
 
 fn wrap_token_domains(domains: &[EffectDomain]) -> Vec<Option<EffectDomain>> {
     domains.iter().map(|d| Some(*d)).collect()
 }
 
-fn consume_token_inputs(
-    inputs: &mut Vec<Value>,
-    expected: &[Option<EffectDomain>],
-) -> Result<()> {
+fn consume_token_inputs(inputs: &mut Vec<Value>, expected: &[Option<EffectDomain>]) -> Result<()> {
     for domain in expected.iter().rev() {
         let value = inputs
             .pop()
@@ -111,7 +181,10 @@ fn consume_token_inputs(
                     *expected_domain
                 );
             }
-            (other, _) => bail!("effectful node missing token input, got {:?}", other.type_tag()),
+            (other, _) => bail!(
+                "effectful node missing token input, got {:?}",
+                other.type_tag()
+            ),
         }
     }
     Ok(())
@@ -137,10 +210,7 @@ fn validate_output_tokens(outputs: &[Value], expected: &[Option<EffectDomain>]) 
             }
             (Some(Value::Token(Some(_))), None) => {}
             (Some(Value::Token(None)), Some(expected)) => {
-                bail!(
-                    "node returned generic token, expected {:?}",
-                    *expected
-                );
+                bail!("node returned generic token, expected {:?}", *expected);
             }
             (Some(Value::Token(None)), None) => {}
             (Some(other), _) => {
@@ -151,10 +221,7 @@ fn validate_output_tokens(outputs: &[Value], expected: &[Option<EffectDomain>]) 
                 );
             }
             (None, _) => {
-                bail!(
-                    "effectful node missing token output at index {}",
-                    idx
-                );
+                bail!("effectful node missing token output at index {}", idx);
             }
         }
     }
@@ -183,6 +250,7 @@ fn run_word_with_info(
             );
         }
     }
+    evaluate_guards(conn, info, args)?;
     let mut cache: HashMap<[u8; 32], Vec<Value>> = HashMap::new();
     let outputs = eval_return(conn, &info.root, &mut cache, args, info)?;
     let token_domains = wrap_token_domains(&word_token_domains(info));
@@ -646,11 +714,30 @@ fn decode_guard_type_key(bytes: &[u8]) -> Result<TypeTag> {
 
 fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) -> Result<Value> {
     let info = load_prim_info(conn, prim_cid)?;
-    let name = list_names_for_cid(conn, "prim", prim_cid)?
+    let names: Vec<String> = list_names_for_cid(conn, "prim", prim_cid)?
         .into_iter()
-        .next();
+        .collect();
+    let mut preferred_base: Option<String> = None;
+    const PRIMITIVE_PRIORITY: &[&str] = &[
+        "eq_i64", "gt_i64", "ge_i64", "lt_i64", "le_i64", "and", "or", "not", "add_i64", "sub_i64",
+    ];
+    for target in PRIMITIVE_PRIORITY {
+        if names
+            .iter()
+            .any(|candidate| candidate.rsplit('/').next().unwrap_or(candidate) == *target)
+        {
+            preferred_base = Some((*target).to_string());
+            break;
+        }
+    }
+    let full_name = names.first().cloned();
+    let base = preferred_base.as_deref().or_else(|| {
+        full_name
+            .as_deref()
+            .map(|n| n.rsplit('/').next().unwrap_or(n))
+    });
 
-    match name.as_deref() {
+    match base {
         Some("add_i64") => {
             require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
             if inputs.len() != 2 {
@@ -677,124 +764,197 @@ fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) ->
             };
             Ok(Value::I64(result))
         }
-        Some("state.read_i64") => {
-            require_sig(&info, &[TypeTag::Ptr], &[TypeTag::I64])?;
-            if inputs.len() != 1 {
-                bail!("state.read_i64 expects 1 argument, got {}", inputs.len());
-            }
-            let key = quote_key(&inputs[0])?;
-            match global_store::read(&key) {
-                Some(Value::I64(n)) => Ok(Value::I64(n)),
-                Some(other) => bail!(
-                    "state entry `{key}` holds incompatible value {:?}",
-                    other.type_tag()
-                ),
-                None => bail!("state entry `{key}` not found"),
-            }
-        }
-        Some("state.read_f64") => {
-            require_sig(&info, &[TypeTag::Ptr], &[TypeTag::F64])?;
-            if inputs.len() != 1 {
-                bail!("state.read_f64 expects 1 argument, got {}", inputs.len());
-            }
-            let key = quote_key(&inputs[0])?;
-            match global_store::read(&key) {
-                Some(Value::F64(x)) => Ok(Value::F64(x)),
-                Some(other) => bail!(
-                    "state entry `{key}` holds incompatible value {:?}",
-                    other.type_tag()
-                ),
-                None => bail!("state entry `{key}` not found"),
-            }
-        }
-        Some("state.read_ptr") => {
-            require_sig(&info, &[TypeTag::Ptr], &[TypeTag::Ptr])?;
-            if inputs.len() != 1 {
-                bail!("state.read_ptr expects 1 argument, got {}", inputs.len());
-            }
-            let key = quote_key(&inputs[0])?;
-            match global_store::read(&key) {
-                Some(Value::Tuple(values)) => Ok(Value::Tuple(values)),
-                Some(Value::Quote(cid)) => Ok(Value::Quote(cid)),
-                Some(other) => bail!(
-                    "state entry `{key}` holds incompatible value {:?}",
-                    other.type_tag()
-                ),
-                None => bail!("state entry `{key}` not found"),
-            }
-        }
-        Some("state.read_text") => {
-            require_sig(&info, &[TypeTag::Ptr], &[TypeTag::Text])?;
-            if inputs.len() != 1 {
-                bail!("state.read_text expects 1 argument, got {}", inputs.len());
-            }
-            let key = quote_key(&inputs[0])?;
-            match global_store::read(&key) {
-                Some(Value::Text(s)) => Ok(Value::Text(s)),
-                Some(other) => bail!(
-                    "state entry `{key}` holds incompatible value {:?}",
-                    other.type_tag()
-                ),
-                None => bail!("state entry `{key}` not found"),
-            }
-        }
-        Some("state.write_i64") => {
-            require_sig(&info, &[TypeTag::Ptr, TypeTag::I64], &[TypeTag::Unit])?;
+        Some("eq_i64") => {
+            require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
             if inputs.len() != 2 {
-                bail!("state.write_i64 expects 2 arguments, got {}", inputs.len());
+                bail!("eq_i64 expects 2 arguments, got {}", inputs.len());
             }
-            let key = quote_key(&inputs[0])?;
-            let value = value_to_i64(&inputs[1])?;
-            global_store::write(key, Value::I64(value));
-            Ok(Value::Unit)
+            let lhs = value_to_i64(&inputs[0])?;
+            let rhs = value_to_i64(&inputs[1])?;
+            Ok(Value::I64(if lhs == rhs { -1 } else { 0 }))
         }
-        Some("state.write_f64") => {
-            require_sig(&info, &[TypeTag::Ptr, TypeTag::F64], &[TypeTag::Unit])?;
+        Some("lt_i64") => {
+            require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
             if inputs.len() != 2 {
-                bail!("state.write_f64 expects 2 arguments, got {}", inputs.len());
+                bail!("lt_i64 expects 2 arguments, got {}", inputs.len());
             }
-            let key = quote_key(&inputs[0])?;
-            let value = value_to_f64(&inputs[1])?;
-            global_store::write(key, Value::F64(value));
-            Ok(Value::Unit)
+            let lhs = value_to_i64(&inputs[0])?;
+            let rhs = value_to_i64(&inputs[1])?;
+            Ok(Value::I64(if lhs < rhs { -1 } else { 0 }))
         }
-        Some("state.write_ptr") => {
-            require_sig(&info, &[TypeTag::Ptr, TypeTag::Ptr], &[TypeTag::Unit])?;
+        Some("gt_i64") => {
+            require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
             if inputs.len() != 2 {
-                bail!("state.write_ptr expects 2 arguments, got {}", inputs.len());
+                bail!("gt_i64 expects 2 arguments, got {}", inputs.len());
             }
-            let key = quote_key(&inputs[0])?;
-            let value = match &inputs[1] {
-                Value::Tuple(_) | Value::Quote(_) => inputs[1].clone(),
-                other => bail!(
-                    "state.write_ptr expects tuple or quote value, got {:?}",
-                    other.type_tag()
-                ),
-            };
-            global_store::write(key, value);
-            Ok(Value::Unit)
+            let lhs = value_to_i64(&inputs[0])?;
+            let rhs = value_to_i64(&inputs[1])?;
+            Ok(Value::I64(if lhs > rhs { -1 } else { 0 }))
         }
-        Some("state.write_text") => {
-            require_sig(&info, &[TypeTag::Ptr, TypeTag::Text], &[TypeTag::Unit])?;
+        Some("le_i64") => {
+            require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
             if inputs.len() != 2 {
-                bail!("state.write_text expects 2 arguments, got {}", inputs.len());
+                bail!("le_i64 expects 2 arguments, got {}", inputs.len());
             }
-            let key = quote_key(&inputs[0])?;
-            let value = match &inputs[1] {
-                Value::Text(s) => Value::Text(s.clone()),
-                other => bail!(
-                    "state.write_text expects text value, got {:?}",
-                    other.type_tag()
-                ),
-            };
-            global_store::write(key, value);
-            Ok(Value::Unit)
+            let lhs = value_to_i64(&inputs[0])?;
+            let rhs = value_to_i64(&inputs[1])?;
+            Ok(Value::I64(if lhs <= rhs { -1 } else { 0 }))
         }
-        Some(other) => bail!("primitive `{other}` not supported in runner"),
-        None => bail!(
-            "primitive {} not registered with a name (runner needs a symbolic name)",
-            cid::to_hex(prim_cid)
-        ),
+        Some("ge_i64") => {
+            require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
+            if inputs.len() != 2 {
+                bail!("ge_i64 expects 2 arguments, got {}", inputs.len());
+            }
+            let lhs = value_to_i64(&inputs[0])?;
+            let rhs = value_to_i64(&inputs[1])?;
+            Ok(Value::I64(if lhs >= rhs { -1 } else { 0 }))
+        }
+        Some("and") => {
+            require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
+            if inputs.len() != 2 {
+                bail!("and expects 2 arguments, got {}", inputs.len());
+            }
+            let lhs = value_to_i64(&inputs[0])? != 0;
+            let rhs = value_to_i64(&inputs[1])? != 0;
+            Ok(Value::I64(if lhs && rhs { -1 } else { 0 }))
+        }
+        Some("or") => {
+            require_sig(&info, &[TypeTag::I64, TypeTag::I64], &[TypeTag::I64])?;
+            if inputs.len() != 2 {
+                bail!("or expects 2 arguments, got {}", inputs.len());
+            }
+            let lhs = value_to_i64(&inputs[0])? != 0;
+            let rhs = value_to_i64(&inputs[1])? != 0;
+            Ok(Value::I64(if lhs || rhs { -1 } else { 0 }))
+        }
+        Some("not") => {
+            require_sig(&info, &[TypeTag::I64], &[TypeTag::I64])?;
+            if inputs.len() != 1 {
+                bail!("not expects 1 argument, got {}", inputs.len());
+            }
+            let value = value_to_i64(&inputs[0])?;
+            Ok(Value::I64(if value == 0 { -1 } else { 0 }))
+        }
+        _ => match full_name.as_deref() {
+            Some("state.read_i64") => {
+                require_sig(&info, &[TypeTag::Ptr], &[TypeTag::I64])?;
+                if inputs.len() != 1 {
+                    bail!("state.read_i64 expects 1 argument, got {}", inputs.len());
+                }
+                let key = quote_key(&inputs[0])?;
+                match global_store::read(&key) {
+                    Some(Value::I64(n)) => Ok(Value::I64(n)),
+                    Some(other) => bail!(
+                        "state entry `{key}` holds incompatible value {:?}",
+                        other.type_tag()
+                    ),
+                    None => bail!("state entry `{key}` not found"),
+                }
+            }
+            Some("state.read_f64") => {
+                require_sig(&info, &[TypeTag::Ptr], &[TypeTag::F64])?;
+                if inputs.len() != 1 {
+                    bail!("state.read_f64 expects 1 argument, got {}", inputs.len());
+                }
+                let key = quote_key(&inputs[0])?;
+                match global_store::read(&key) {
+                    Some(Value::F64(x)) => Ok(Value::F64(x)),
+                    Some(other) => bail!(
+                        "state entry `{key}` holds incompatible value {:?}",
+                        other.type_tag()
+                    ),
+                    None => bail!("state entry `{key}` not found"),
+                }
+            }
+            Some("state.read_ptr") => {
+                require_sig(&info, &[TypeTag::Ptr], &[TypeTag::Ptr])?;
+                if inputs.len() != 1 {
+                    bail!("state.read_ptr expects 1 argument, got {}", inputs.len());
+                }
+                let key = quote_key(&inputs[0])?;
+                match global_store::read(&key) {
+                    Some(Value::Tuple(values)) => Ok(Value::Tuple(values)),
+                    Some(Value::Quote(cid)) => Ok(Value::Quote(cid)),
+                    Some(other) => bail!(
+                        "state entry `{key}` holds incompatible value {:?}",
+                        other.type_tag()
+                    ),
+                    None => bail!("state entry `{key}` not found"),
+                }
+            }
+            Some("state.read_text") => {
+                require_sig(&info, &[TypeTag::Ptr], &[TypeTag::Text])?;
+                if inputs.len() != 1 {
+                    bail!("state.read_text expects 1 argument, got {}", inputs.len());
+                }
+                let key = quote_key(&inputs[0])?;
+                match global_store::read(&key) {
+                    Some(Value::Text(s)) => Ok(Value::Text(s)),
+                    Some(other) => bail!(
+                        "state entry `{key}` holds incompatible value {:?}",
+                        other.type_tag()
+                    ),
+                    None => bail!("state entry `{key}` not found"),
+                }
+            }
+            Some("state.write_i64") => {
+                require_sig(&info, &[TypeTag::Ptr, TypeTag::I64], &[TypeTag::Unit])?;
+                if inputs.len() != 2 {
+                    bail!("state.write_i64 expects 2 arguments, got {}", inputs.len());
+                }
+                let key = quote_key(&inputs[0])?;
+                let value = value_to_i64(&inputs[1])?;
+                global_store::write(key, Value::I64(value));
+                Ok(Value::Unit)
+            }
+            Some("state.write_f64") => {
+                require_sig(&info, &[TypeTag::Ptr, TypeTag::F64], &[TypeTag::Unit])?;
+                if inputs.len() != 2 {
+                    bail!("state.write_f64 expects 2 arguments, got {}", inputs.len());
+                }
+                let key = quote_key(&inputs[0])?;
+                let value = value_to_f64(&inputs[1])?;
+                global_store::write(key, Value::F64(value));
+                Ok(Value::Unit)
+            }
+            Some("state.write_ptr") => {
+                require_sig(&info, &[TypeTag::Ptr, TypeTag::Ptr], &[TypeTag::Unit])?;
+                if inputs.len() != 2 {
+                    bail!("state.write_ptr expects 2 arguments, got {}", inputs.len());
+                }
+                let key = quote_key(&inputs[0])?;
+                let value = match &inputs[1] {
+                    Value::Tuple(_) | Value::Quote(_) => inputs[1].clone(),
+                    other => bail!(
+                        "state.write_ptr expects tuple or quote value, got {:?}",
+                        other.type_tag()
+                    ),
+                };
+                global_store::write(key, value);
+                Ok(Value::Unit)
+            }
+            Some("state.write_text") => {
+                require_sig(&info, &[TypeTag::Ptr, TypeTag::Text], &[TypeTag::Unit])?;
+                if inputs.len() != 2 {
+                    bail!("state.write_text expects 2 arguments, got {}", inputs.len());
+                }
+                let key = quote_key(&inputs[0])?;
+                let value = match &inputs[1] {
+                    Value::Text(s) => Value::Text(s.clone()),
+                    other => bail!(
+                        "state.write_text expects text value, got {:?}",
+                        other.type_tag()
+                    ),
+                };
+                global_store::write(key, value);
+                Ok(Value::Unit)
+            }
+            Some(other) => bail!("primitive `{other}` not supported in runner"),
+            None => bail!(
+                "primitive {} not registered with a name (runner needs a symbolic name)",
+                cid::to_hex(prim_cid)
+            ),
+        },
     }
 }
 
@@ -802,11 +962,11 @@ fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) ->
 mod tests {
     use super::*;
     use crate::builder::GraphBuilder;
+    use crate::global_store;
     use crate::node::{NodeCanon, NodeInput, NodeKind, NodePayload};
     use crate::prim::{self, PrimCanon};
     use crate::store;
     use crate::types::{EffectDomain, TypeTag, effect_mask};
-    use crate::global_store;
 
     fn guard_key(tag: TypeTag) -> [u8; 32] {
         let mut bytes = [0u8; 32];
@@ -856,11 +1016,7 @@ mod tests {
         builder.apply_prim(prim_outcome.cid)?;
         let word_cid = builder.finish_word(&params, &results, Some("demo/add_multi"))?;
 
-        let outputs = run_word(
-            &conn,
-            &word_cid,
-            &[Value::I64(1), Value::I64(2)],
-        )?;
+        let outputs = run_word(&conn, &word_cid, &[Value::I64(1), Value::I64(2)])?;
 
         assert_eq!(outputs.len(), 3);
         assert_eq!(outputs[0], Value::Token(Some(EffectDomain::Io)));
@@ -1013,7 +1169,8 @@ mod tests {
         builder.quote(key)?;
         builder.apply_prim(read_outcome.cid)?;
         builder.unpair(TypeTag::I64, TypeTag::I64)?;
-        let word_cid = builder.finish_word(&[], &[TypeTag::I64, TypeTag::I64], Some("state/pair"))?;
+        let word_cid =
+            builder.finish_word(&[], &[TypeTag::I64, TypeTag::I64], Some("state/pair"))?;
 
         let outputs = run_word(&conn, &word_cid, &[])?;
         assert_eq!(outputs.len(), 3);
@@ -1065,7 +1222,8 @@ mod tests {
         builder.drop()?;
         builder.quote(key)?;
         builder.apply_prim(read_outcome.cid)?;
-        let word_cid = builder.finish_word(&[TypeTag::Text], &[TypeTag::Text], Some("state/text"))?;
+        let word_cid =
+            builder.finish_word(&[TypeTag::Text], &[TypeTag::Text], Some("state/text"))?;
 
         let outputs = run_word(&conn, &word_cid, &[Value::Text("hello".to_string())])?;
         assert_eq!(outputs.len(), 2);
@@ -1074,6 +1232,156 @@ mod tests {
 
         let stored = global_store::read(&cid::to_hex(&key)).expect("value persisted");
         assert_eq!(stored, Value::Text("hello".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn guard_failure_blocks_word() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_guard(&[])?;
+        builder.push_lit_i64(0)?;
+        let guard_cid = builder.finish_guard(&[], &[TypeTag::I64], Some("guard/false"))?;
+
+        builder.begin_word(&[])?;
+        builder.attach_guard(guard_cid);
+        builder.push_lit_i64(5)?;
+        let word_cid = builder.finish_word(&[], &[TypeTag::I64], Some("demo/guarded"))?;
+
+        let err = run_word(&conn, &word_cid, &[]).unwrap_err();
+        assert!(err.to_string().contains("guard"));
+        Ok(())
+    }
+
+    #[test]
+    fn guard_success_allows_word() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_guard(&[])?;
+        builder.push_lit_i64(-1)?;
+        let guard_cid = builder.finish_guard(&[], &[TypeTag::I64], Some("guard/true"))?;
+
+        builder.begin_word(&[])?;
+        builder.attach_guard(guard_cid);
+        builder.push_lit_i64(42)?;
+        let word_cid = builder.finish_word(&[], &[TypeTag::I64], Some("demo/guarded_ok"))?;
+
+        let outputs = run_word(&conn, &word_cid, &[])?;
+        assert_eq!(outputs.last(), Some(&Value::I64(42)));
+        Ok(())
+    }
+
+    #[test]
+    fn boolean_primitives_evaluate() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let prims = [
+            (
+                "core/eq_i64",
+                "eq_i64",
+                &[TypeTag::I64, TypeTag::I64][..],
+                &[TypeTag::I64][..],
+            ),
+            (
+                "core/gt_i64",
+                "gt_i64",
+                &[TypeTag::I64, TypeTag::I64][..],
+                &[TypeTag::I64][..],
+            ),
+            (
+                "core/lt_i64",
+                "lt_i64",
+                &[TypeTag::I64, TypeTag::I64][..],
+                &[TypeTag::I64][..],
+            ),
+            (
+                "core/le_i64",
+                "le_i64",
+                &[TypeTag::I64, TypeTag::I64][..],
+                &[TypeTag::I64][..],
+            ),
+            (
+                "core/ge_i64",
+                "ge_i64",
+                &[TypeTag::I64, TypeTag::I64][..],
+                &[TypeTag::I64][..],
+            ),
+            (
+                "core/and",
+                "and",
+                &[TypeTag::I64, TypeTag::I64][..],
+                &[TypeTag::I64][..],
+            ),
+            (
+                "core/or",
+                "or",
+                &[TypeTag::I64, TypeTag::I64][..],
+                &[TypeTag::I64][..],
+            ),
+            ("core/not", "not", &[TypeTag::I64][..], &[TypeTag::I64][..]),
+        ];
+
+        let mut prim_ids = std::collections::HashMap::new();
+        for (name, tag, params, results) in prims {
+            let prim = PrimCanon {
+                params,
+                results,
+                effects: &[],
+                effect_mask: effect_mask::NONE,
+            };
+            let outcome = prim::store_prim(&conn, &prim)?;
+            store::put_name(&conn, "prim", name, &outcome.cid)?;
+            prim_ids.insert(tag.to_string(), outcome.cid);
+        }
+
+        // eq word
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[TypeTag::I64, TypeTag::I64])?;
+        builder.apply_prim(*prim_ids.get("eq_i64").unwrap())?;
+        let eq_word = builder.finish_word(
+            &[TypeTag::I64, TypeTag::I64],
+            &[TypeTag::I64],
+            Some("word/eq"),
+        )?;
+
+        let outputs = run_word(&conn, &eq_word, &[Value::I64(5), Value::I64(5)])?;
+        assert_eq!(outputs.last(), Some(&Value::I64(-1)));
+
+        let outputs = run_word(&conn, &eq_word, &[Value::I64(4), Value::I64(5)])?;
+        assert_eq!(outputs.last(), Some(&Value::I64(0)));
+
+        // not word
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[TypeTag::I64])?;
+        builder.apply_prim(*prim_ids.get("not").unwrap())?;
+        let not_word = builder.finish_word(&[TypeTag::I64], &[TypeTag::I64], Some("word/not"))?;
+
+        let outputs = run_word(&conn, &not_word, &[Value::I64(0)])?;
+        assert_eq!(outputs.last(), Some(&Value::I64(-1)));
+        let outputs = run_word(&conn, &not_word, &[Value::I64(-1)])?;
+        assert_eq!(outputs.last(), Some(&Value::I64(0)));
+
+        // and word
+        let mut builder = GraphBuilder::new(&conn);
+        builder.begin_word(&[TypeTag::I64, TypeTag::I64])?;
+        builder.apply_prim(*prim_ids.get("and").unwrap())?;
+        let and_word = builder.finish_word(
+            &[TypeTag::I64, TypeTag::I64],
+            &[TypeTag::I64],
+            Some("word/and"),
+        )?;
+
+        let outputs = run_word(&conn, &and_word, &[Value::I64(-1), Value::I64(-1)])?;
+        assert_eq!(outputs.last(), Some(&Value::I64(-1)));
+
+        let outputs = run_word(&conn, &and_word, &[Value::I64(-1), Value::I64(0)])?;
+        assert_eq!(outputs.last(), Some(&Value::I64(0)));
+
         Ok(())
     }
 
@@ -1173,6 +1481,7 @@ mod tests {
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: Vec::new(),
             effect_mask: effect_mask::NONE,
+            guards: Vec::new(),
         };
         let word_cid = crate::word::store_word(&conn, &word)?.cid;
 
@@ -1263,6 +1572,7 @@ mod tests {
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: Vec::new(),
             effect_mask: effect_mask::NONE,
+            guards: Vec::new(),
         };
         let word_cid = crate::word::store_word(&conn, &word)?.cid;
 
@@ -1353,6 +1663,7 @@ mod tests {
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: Vec::new(),
             effect_mask: effect_mask::NONE,
+            guards: Vec::new(),
         };
         let word_cid = crate::word::store_word(&conn, &word)?.cid;
 
@@ -1442,6 +1753,7 @@ mod tests {
             results: vec![TypeTag::I64.as_atom().to_string()],
             effects: Vec::new(),
             effect_mask: effect_mask::NONE,
+            guards: Vec::new(),
         };
         let word_cid = crate::word::store_word(&conn, &word)?.cid;
 
