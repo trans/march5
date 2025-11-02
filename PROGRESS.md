@@ -1,20 +1,19 @@
 # March α₅ Project Progress
 
 ## Snapshot
-- `cargo test` passes locally (2025-03-05) with 47 core unit tests plus CLI/webui smoke checks (offline mode).
-- Working tree tracked on branch `main`; recent focus is on guard support, YAML tooling, and boolean predicate primitives.
+- `cargo test` passes locally (2025-03-05) with 55 core unit tests plus CLI/webui smoke checks (offline mode).
+- Working tree on `main`; guard dispatch lowering is merged, next focus is transaction scaffolding.
 
 ## Implemented Capabilities
 - **Object encoding & storage**: canonical CBOR emitters exist for primitives, nodes (including `RETURN`/multi-result support), words, interfaces, and namespaces; persisted through SQLite (`src/store.rs`).
-- **CLI tooling**: binary in `src/main.rs` supports `new`, `effect`, `prim`, `iface`, `namespace`, `node`, `word`, `builder`, `run`, and `catalog` subcommands; YAML loaders power `run --args-yaml` and catalog import with regression coverage.
+- **CLI tooling**: binary in `src/main.rs` supports `new`, `effect`, `prim`, `iface`, `namespace`, `node`, `word`, `guard`, `builder`, `run`, and `catalog` subcommands; YAML loaders power `run --args-yaml` and catalog import with regression coverage.
 - **Graph builder**: `GraphBuilder` (`src/builder.rs`) assembles graphs from a Forth-like stack machine, tracks effect-domain tokens, emits `RETURN` nodes, attaches guard quotations, and registers words in the name index.
-- **Guard quotations & predicates**: guards compile to pure quotations with stored CIDs, the interpreter runs them transactionally before word bodies, and boolean/comparison primitives (`eq_i64`, `gt_i64`, `and`, `or`, `not`, etc.) are available for guard logic.
+- **Guard quotations & predicates**: guards compile to pure quotations with stored CIDs, builder attaches them to words and dispatch cases, the interpreter consumes lowered guard graphs with deopt fallbacks (legacy three-field dispatch payloads still decode), CLI supports `guard add/list/show`, `word add --guard ...`, and the REPL can `begin-guard`/`finish-guard` and `attach-guard`; boolean/comparison primitives (`eq_i64`, `gt_i64`, `and`, `or`, `not`, etc.) are available for guard logic.
 - **Interpreter & exec stubs**: `run_word` in `src/interp.rs` evaluates graphs (including catalog-authored guards, APPLY nodes, and token threading); `src/exec.rs` contains a minimal JIT stub for add/sub primitives.
 - **Web UI**: `src/bin/webui.rs` serves HTML + JSON views over objects stored in a March database.
 
 ## Known Gaps & Divergences
 - Interface encoding currently serialises under the `names` key with per-symbol maps; the design documents expect a `symbols` array with positional fields.
-- Guard lowering into Mini-INet dispatch (parallel reduction, overload search) remains to be implemented; current runtime evaluates guard quotations sequentially ahead of the body.
 - Effect masks collapse to `effect_mask::IO`; other bit flags exist in `src/types.rs` but have no integration.
 - Namespace imports encode raw interface CIDs but do not retain alias metadata (`use` sugar) as noted in DESIGN-II (expected, but flag for future ergonomic layers).
 - Context dispatch, transactions, durability policies, and richer token pools described in DESIGN-IV/V remain to be prototyped beyond placeholder node kinds.

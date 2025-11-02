@@ -64,14 +64,15 @@ List the registered namespaces:
 target/release/march5 --db demo.march5.db namespace list --prefix demo.
 ```
 
-Launch the interactive builder to script graphs without manually wiring CIDs:
+Launch the interactive builder to script graphs and guards without manually wiring CIDs:
 
 ```bash
 target/release/march5 --db demo.march5.db builder
 ```
 
-Inside the REPL you can run commands such as `begin`, `lit`, `prim <primCID>`,
-`call <wordCID>`, `dup`, `swap`, `over`, and `finish <result> [name]`. Type
+Inside the REPL you can run commands such as `begin` / `begin-guard`, `lit`,
+`prim <primCID|name>`, `call <wordCID|name>`, `dup`, `swap`, `over`,
+`attach-guard <name|cid>`, and `finish` / `finish-guard <result> [name]`. Type
 `help` in the prompt for the full list.
 
 Start the lightweight web UI (serves HTML + JSON endpoints):
@@ -129,6 +130,25 @@ List the registered words under a namespace prefix:
 target/release/march5 --db demo.march5.db word list --prefix demo.math/
 ```
 
+Add a guard quotation (expects a RETURN-rooted node and a single i64 result):
+
+```bash
+target/release/march5 --db demo.march5.db guard add \
+  --name demo.guards/always_true \
+  --root <return_root_cid> \
+  --result i64
+```
+
+Attach guards when adding a word (names or hex CIDs):
+
+```bash
+target/release/march5 --db demo.march5.db word add \
+  --name demo.math/secure_add \
+  --root <root_cid> \
+  --result i64 \
+  --guard demo.guards/always_true
+```
+
 ## YAML catalog loader
 
 The `catalog` subcommand consumes a YAML document that mirrors the March
@@ -137,6 +157,7 @@ namespacing scheme. Tags describe the type of each entry:
 - `!effect` — stores a canonical effect (optional `doc` field)
 - `!prim` — declares a primitive (`params`, `results`, optional `effects`, `emask`)
 - `!word` — builds a word via a simple stack sequence (`params`, `results`, `stack`)
+- `!overloads` — groups multiple implementations under one symbol (each entry has `params`, `results`, optional `guards`, and `stack`)
 - `!snapshot` — writes a global-store snapshot (keys map to tagged values)
 
 Example (`catalog.yaml`):
@@ -150,6 +171,18 @@ core:
 demo:
   io: !effect
     doc: "performs IO"
+  # Overloaded symbol with two implementations
+  add: !overloads
+    - !word
+      params: [i64, i64]
+      results: [i64]
+      stack:
+        - !prim core/add_i64
+    - !word
+      params: [text, text]
+      results: [text]
+      stack:
+        - !word text/concat
   counter: !snapshot
     demo.counter: !i64 0
   double: !word
@@ -225,3 +258,15 @@ cargo test
 ```
 
 Library consumers can use the `GraphBuilder` API (`src/builder.rs`) to assemble graphs in a Forth-like manner while reusing the same storage primitives exposed through the CLI.
+Notes on `!overloads`:
+- The importer expands each entry into a concrete word under a derived name `<base>#<params->results>`, and logs the set.
+- Guards may be listed per entry via `guards: [namespace/guard_name, ...]`.
+- Today, calling an overloaded symbol by base name is not yet wired; call the derived name directly or refer to implementations by name. A static resolver at build time and/or a synthesized dispatcher word are planned next.
+- **Inet Agents and Rules**  
+  Manage low-level inet definitions (agents and rewiring rules):  
+  - `agent add --kind pair --port principal --port head --port tail --name core/pair`  
+    `agent list --prefix core/`  
+    `agent show core/pair`  
+  - `rule add --lhs-a dispatch --lhs-b apply --rewire "(connect ...)" --name core/dispatch-apply`  
+    `rule list --prefix core/`  
+    `rule show core/dispatch-apply`
