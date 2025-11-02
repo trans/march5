@@ -1,13 +1,18 @@
 # Interaction-Nets Plan (Agents + Rules)
 
-## PROGRESS
+## Progress
 
-* ✅ **Graph builder**: `GraphBuilder` (`src/builder.rs`) assembles graphs from a Forth-like stack machine, tracks effect-domain tokens, emits `RETURN` nodes, attaches guard quotations, and registers words in the name index.
+- ✅ **Graph builder**: `GraphBuilder` (`src/builder.rs`) assembles graphs from a Forth-like stack machine, tracks effect-domain tokens, emits `RETURN` nodes, and keeps the name index in sync.
+- ✅ **Net scaffolding**: `inet.rs` encodes agent/rule objects, a reducer scaffold, and a work-in-progress DSL for rewrites (pair/unpair sample rule in place).
+- ✅ **Dispatch + guards**: guard lowering feeds into the future inet dispatcher (guard graphs already available on dispatch nodes).
 
-* **Interpreter & exec stubs**: `run_word` in `src/interp.rs` evaluates graphs (including catalog-authored guards, APPLY nodes, and token threading); `src/exec.rs` contains a minimal JIT stub for add/sub primitives.
+## Next Steps
 
-* `RETURN`/multi-output encoding is in place; legacy `ty` fields have been removed.
+- Flesh out core rewrite rules (guard type, if/deopt, call/apply, return/token threading) so the reducer can run more of the existing graph inventory.
+- Build the graph→inet translator that opportunistically reduces nets and falls back to the interpreter where rules are missing.
+- Capture design updates in `docs/design/DESIGN-INET.md` as the ABI firms up.
 
 ## Design Considerations
 
-TODO
+- Keep the reducer incremental: aim for hybrid execution (inet reduction for parts with rules, interpreter fallback elsewhere) to avoid blocking feature delivery.
+- Track compatibility between inet agents and existing node kinds so we can highlight missing translation paths early.

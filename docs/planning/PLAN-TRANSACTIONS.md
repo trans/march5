@@ -1,9 +1,16 @@
-# Tr
+# Transactions & Context Plan
 
-## Completed Progress
+## Progress
 
-* None yet.
+- Pending – no prototype exists yet.
 
-## Design Considertions
+## Next Steps
 
-* **Transaction scaffolding**: add node kinds and builder helpers for `TXN_BEGIN/COMMIT/ABORT`, threading transaction IDs through the token pool and effect frontier.
+- Sketch the node/DSL surface for `TXN_BEGIN`, `TXN_COMMIT`, `TXN_ABORT`, and token threading so the builder/interpreter semantics are clear.
+- Decide how guard evaluation interacts with transactional contexts (e.g., guard failures triggering aborts vs. soft retries).
+- Document storage implications (persistence layer, durability knobs) in `docs/design/DESIGN-V.md`.
+
+## Design Considerations
+
+- Transactions should compose with existing effect tokens; avoid introducing a separate channel unless necessary.
+- Start with in-memory semantics to prove out the API, then layer in persistence/durability guarantees before shipping.

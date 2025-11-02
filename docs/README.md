@@ -1,25 +1,24 @@
 # Documentation
 
-## Design Folder
+## Directory Map
 
-The design directory contains documents we have been using to help guide overall design.
+- `docs/design/` – longer-form design references and historical proposals. They capture intent, but may lag behind the implementation; prefer the codebase for ground-truth semantics.
+- `docs/planning/` – active workstreams. Each `PLAN-*.md` file tracks progress for a particular area (CLI, guards, inet, etc.) with separate “Progress” and “Design Considerations” sections. Archive completed plans under `docs/planning/history/`.
+- `STATUS.md` – living scratchpad for “what we’re working on right now”. Update this as work moves between sessions.
 
-Do not expect them to be complete, accurate or completely aligned with implmentation.
-Some things have changed due to implmentation considerations during develpoment,
-but the design document haven't been update to reflect that.
+## Keeping Things Current
 
-## Planning Folder
+1. When you land meaningful progress in a subsystem, update the relevant `PLAN-*.md` file’s **Progress** section before closing your branch.
+2. Capture new ideas, outstanding questions, or unanswered design trade-offs in `docs/planning/OPEN-QUESTIONS.md`.
+3. If a design doc diverges materially from the code, either refresh the affected section or add a short “Implementation Notes (YYYY-MM-DD)” callout describing the deviation.
 
-The planning folder had mutiple PLAN-*md files each focused on specific plans.
+## Quick Links
 
-When a plan is considered complete, update the progress at the top of the file,
-and then it can be moved to the history folder.
-
-Please note, that this organization came some what late to the project, so it
-is not altogether complete.
+- Design overviews: [`docs/design/`](design/)
+- Active plans: [`docs/planning/`](planning/)
+- Status scratchpad: [`STATUS.md`](../STATUS.md)
 
 ## Notes
 
 - `target/` contains compiled artifacts from the latest `cargo test` run.
-
 
