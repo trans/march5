@@ -31,3 +31,40 @@ Inspect with CLI:
 cargo run --bin march5 -- --db examples/helloworld.march5.db namespace show org.march.helloworld
 cargo run --bin march5 -- --db examples/helloworld.march5.db word show org.march.helloworld/hello
 ```
+## YAML `!overloads` example
+
+You can register multiple implementations under one symbol using `!overloads`.
+Each entry specifies `params`, `results`, optional `guards`, and a `stack` body.
+
+Example:
+
+```yaml
+core:
+  add_i64: !prim
+    params: [i64, i64]
+    results: [i64]
+text:
+  concat: !word
+    params: [text, text]
+    results: [text]
+    stack:
+      - !dup
+      - !prim core/add_i64   # placeholder; replace with proper concat prim/word
+demo:
+  add: !overloads
+    - !word
+      params: [i64, i64]
+      results: [i64]
+      stack:
+        - !prim core/add_i64
+    - !word
+      params: [text, text]
+      results: [text]
+      stack:
+        - !word text/concat
+```
+
+When applied via `march5 catalog`, each overload is persisted as a concrete
+word under a derived name like `demo/add#i64,i64->i64`. The base symbol is
+reserved for a future dispatcher or static resolver; for now, call the derived
+name or reference the implementation by name.
