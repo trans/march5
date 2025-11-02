@@ -84,6 +84,20 @@ fn handle_request(db_path: &Path, request: Request) -> Result<()> {
                 Err(err) => error_response(404, err),
             }
         }
+        ["api", "agent", rest @ ..] if !rest.is_empty() => {
+            let name = rest.join("/");
+            match fetch_named_json(db_path, "agent", "agent", &name) {
+                Ok(json) => json_response(json),
+                Err(err) => error_response(404, err),
+            }
+        }
+        ["api", "rule", rest @ ..] if !rest.is_empty() => {
+            let name = rest.join("/");
+            match fetch_named_json(db_path, "rule", "rule", &name) {
+                Ok(json) => json_response(json),
+                Err(err) => error_response(404, err),
+            }
+        }
         ["api", "namespace", rest @ ..] if !rest.is_empty() => {
             let name = rest.join("/");
             match fetch_named_json(db_path, "namespace", "namespace", &name) {

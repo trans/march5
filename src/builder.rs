@@ -55,6 +55,7 @@ pub struct GraphBuilder<'conn> {
     conn: &'conn Connection,
     stack: Vec<StackItem>,
     param_types: Vec<TypeTag>,
+    param_inputs: Vec<NodeInput>,
     prim_cache: HashMap<[u8; 32], PrimInfo>,
     word_cache: HashMap<[u8; 32], WordInfo>,
     accumulated_effects: Vec<[u8; 32]>,
@@ -64,6 +65,14 @@ pub struct GraphBuilder<'conn> {
     attached_guards: Vec<[u8; 32]>,
 }
 
+pub struct DispatchSpec<'a> {
+    pub word: [u8; 32],
+    pub params: &'a [TypeTag],
+    pub results: &'a [TypeTag],
+    pub guards: &'a [[u8; 32]],
+    pub effect_mask: EffectMask,
+}
+
 impl<'conn> GraphBuilder<'conn> {
     /// Create a new builder backed by an already-initialised SQLite connection.
     pub fn new(conn: &'conn Connection) -> Self {
@@ -71,6 +80,7 @@ impl<'conn> GraphBuilder<'conn> {
             conn,
             stack: Vec::new(),
             param_types: Vec::new(),
+            param_inputs: Vec::new(),
             prim_cache: HashMap::new(),
             word_cache: HashMap::new(),
             accumulated_effects: Vec::new(),
@@ -133,6 +143,7 @@ impl<'conn> GraphBuilder<'conn> {
     pub fn begin_word(&mut self, params: &[TypeTag]) -> Result<()> {
         self.stack.clear();
         self.param_types = params.to_vec();
+        self.param_inputs.clear();
         self.accumulated_effects.clear();
         self.effect_frontier.clear();
         self.token_pool.clear();
@@ -155,6 +166,10 @@ impl<'conn> GraphBuilder<'conn> {
                 port: 0,
                 ty: *ty,
             });
+            self.param_inputs.push(NodeInput {
+                cid: outcome.cid,
+                port: 0,
+            });
         }
 
         Ok(())
@@ -168,6 +183,213 @@ impl<'conn> GraphBuilder<'conn> {
     /// Current stack depth (number of available outputs).
     pub fn depth(&self) -> usize {
         self.stack.len()
+    }
+
+    /// Peek the types of the top `n` stack items (left-to-right order of consumption).
+    /// Does not modify the stack.
+    pub fn peek_top_types(&self, n: usize) -> Result<Vec<TypeTag>> {
+        if n > self.stack.len() {
+            bail!(
+                "stack underflow while peeking types: need {n}, have {}",
+                self.stack.len()
+            );
+        }
+        let start = self.stack.len() - n;
+        Ok(self.stack[start..].iter().map(|item| item.ty).collect())
+    }
+
+    fn peek_top_inputs(&self, n: usize) -> Result<Vec<NodeInput>> {
+        if n > self.stack.len() {
+            bail!(
+                "stack underflow while peeking inputs: need {n}, have {}",
+                self.stack.len()
+            );
+        }
+        let start = self.stack.len() - n;
+        Ok(self.stack[start..]
+            .iter()
+            .map(|item| NodeInput {
+                cid: item.cid,
+                port: item.port,
+            })
+            .collect())
+    }
+
+    fn guard_type_key(tag: TypeTag) -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        let atom = tag.as_atom().as_bytes();
+        let len = atom.len().min(32);
+        bytes[..len].copy_from_slice(&atom[..len]);
+        bytes
+    }
+
+    /// Apply a DISPATCH over multiple pure candidates with identical result shapes.
+    pub fn apply_dispatch(&mut self, specs: &[DispatchSpec<'_>]) -> Result<[u8; 32]> {
+        if specs.is_empty() {
+            bail!("dispatch requires at least one candidate");
+        }
+        // Validate homogeneity
+        let arity = specs[0].params.len();
+        let results = specs[0].results;
+        for spec in specs {
+            if spec.params.len() != arity {
+                bail!("dispatch candidates must have same arity");
+            }
+            if spec.results != results {
+                bail!("dispatch candidates must agree on result types");
+            }
+            if spec.effect_mask != effect_mask::NONE {
+                bail!("dispatch currently supports only pure candidates");
+            }
+        }
+
+        // Pop inputs once and reuse for all candidates
+        let popped = self.pop_n(arity)?;
+        for (i, (expected, actual)) in specs[0].params.iter().zip(popped.iter()).enumerate() {
+            if expected != &actual.ty {
+                bail!(
+                    "argument {i} type mismatch: expected {:?}, got {:?}",
+                    expected,
+                    actual.ty
+                );
+            }
+        }
+        let top_inputs: Vec<NodeInput> = popped
+            .iter()
+            .map(|item| NodeInput {
+                cid: item.cid,
+                port: item.port,
+            })
+            .collect();
+
+        // Build CALL nodes per candidate and collect cases
+        let mut cases: Vec<crate::node::DispatchCase> = Vec::with_capacity(specs.len());
+        for spec in specs {
+            // Create CALL node
+            let call_node = NodeCanon {
+                kind: NodeKind::Call,
+                out: spec
+                    .results
+                    .iter()
+                    .map(|t| t.as_atom().to_string())
+                    .collect(),
+                inputs: top_inputs.clone(),
+                vals: Vec::new(),
+                deps: Vec::new(),
+                effects: Vec::new(),
+                payload: NodePayload::Word(spec.word),
+            };
+            let call_outcome = node::store_node(self.conn, &call_node)?;
+
+            // Materialise guard call nodes so dispatch can evaluate them in-graph.
+            let mut guard_inputs: Vec<NodeInput> = Vec::with_capacity(spec.guards.len());
+            let mut guard_cids: Vec<[u8; 32]> = Vec::with_capacity(spec.guards.len());
+            for guard_cid in spec.guards.iter() {
+                let ginfo = crate::guard::load_guard_info(self.conn, guard_cid)?;
+                if ginfo.params.len() > spec.params.len() {
+                    bail!(
+                        "guard {} expects {} params, dispatch candidate provides {}",
+                        crate::cid::to_hex(guard_cid),
+                        ginfo.params.len(),
+                        spec.params.len()
+                    );
+                }
+                for (idx, (gtag, ptag)) in ginfo.params.iter().zip(spec.params.iter()).enumerate() {
+                    if gtag != ptag {
+                        bail!(
+                            "guard {} param {} type mismatch: expected {:?}, got {:?}",
+                            crate::cid::to_hex(guard_cid),
+                            idx,
+                            gtag,
+                            ptag
+                        );
+                    }
+                }
+                if ginfo.results.len() != 1 || ginfo.results[0] != TypeTag::I64 {
+                    bail!(
+                        "guard {} must return a single i64 result",
+                        crate::cid::to_hex(guard_cid)
+                    );
+                }
+                if !ginfo.effects.is_empty() || ginfo.effect_mask != effect_mask::NONE {
+                    bail!(
+                        "guard {} declares effects; dispatch guards must be pure",
+                        crate::cid::to_hex(guard_cid)
+                    );
+                }
+
+                let guard_word = word::WordCanon {
+                    root: ginfo.root,
+                    params: ginfo
+                        .params
+                        .iter()
+                        .map(|t| t.as_atom().to_string())
+                        .collect(),
+                    results: vec![TypeTag::I64.as_atom().to_string()],
+                    effects: Vec::new(),
+                    effect_mask: effect_mask::NONE,
+                    guards: Vec::new(),
+                };
+                let guard_word_outcome = word::store_word(self.conn, &guard_word)?;
+
+                let guard_node = NodeCanon {
+                    kind: NodeKind::Call,
+                    out: vec![TypeTag::I64.as_atom().to_string()],
+                    inputs: top_inputs
+                        .iter()
+                        .take(ginfo.params.len())
+                        .copied()
+                        .collect(),
+                    vals: Vec::new(),
+                    deps: Vec::new(),
+                    effects: Vec::new(),
+                    payload: NodePayload::Word(guard_word_outcome.cid),
+                };
+                let guard_outcome = node::store_node(self.conn, &guard_node)?;
+                guard_inputs.push(NodeInput {
+                    cid: guard_outcome.cid,
+                    port: 0,
+                });
+                guard_cids.push(*guard_cid);
+            }
+
+            // Build type keys
+            let mut keys = Vec::with_capacity(spec.params.len());
+            for t in spec.params {
+                keys.push(Self::guard_type_key(*t));
+            }
+            cases.push(crate::node::DispatchCase {
+                type_keys: keys,
+                target: NodeInput {
+                    cid: call_outcome.cid,
+                    port: 0,
+                },
+                guard_inputs,
+                guard_cids,
+            });
+        }
+
+        // Construct DISPATCH node
+        let node = NodeCanon {
+            kind: NodeKind::Dispatch,
+            out: results.iter().map(|t| t.as_atom().to_string()).collect(),
+            inputs: top_inputs,
+            vals: Vec::new(),
+            deps: Vec::new(),
+            effects: Vec::new(),
+            payload: NodePayload::Dispatch { cases },
+        };
+        let outcome = node::store_node(self.conn, &node)?;
+
+        for (idx, ty) in results.iter().enumerate() {
+            self.stack.push(StackItem {
+                cid: outcome.cid,
+                port: idx as u32,
+                ty: *ty,
+            });
+        }
+
+        Ok(outcome.cid)
     }
 
     /// Attach a guard CID to the word currently being built.
@@ -693,6 +915,122 @@ impl<'conn> GraphBuilder<'conn> {
         guard_list.sort();
         guard_list.dedup();
 
+        // Lower guards into the graph as dependency checks (IF cond else DEOPT).
+        // Each guard is a pure quotation that returns i64; cond!=0 passes.
+        for guard_cid in &guard_list {
+            let ginfo = crate::guard::load_guard_info(self.conn, guard_cid)?;
+            // Validate guard arity fits word params
+            if ginfo.params.len() > self.param_inputs.len() {
+                bail!(
+                    "guard {} expects {} params, word provides {}",
+                    crate::cid::to_hex(guard_cid),
+                    ginfo.params.len(),
+                    self.param_inputs.len()
+                );
+            }
+            // Optional: ensure param types align with word param types
+            for (idx, (gtag, wtag)) in ginfo.params.iter().zip(self.param_types.iter()).enumerate()
+            {
+                if gtag != wtag {
+                    bail!(
+                        "guard {} param {} type mismatch: expected {:?}, word has {:?}",
+                        crate::cid::to_hex(guard_cid),
+                        idx,
+                        gtag,
+                        wtag
+                    );
+                }
+            }
+
+            // Materialise a transient word wrapper for the guard root so we can CALL it
+            let guard_word = word::WordCanon {
+                root: ginfo.root,
+                params: ginfo
+                    .params
+                    .iter()
+                    .map(|t| t.as_atom().to_string())
+                    .collect(),
+                results: ginfo
+                    .results
+                    .iter()
+                    .map(|t| t.as_atom().to_string())
+                    .collect(),
+                effects: Vec::new(),
+                effect_mask: effect_mask::NONE,
+                guards: Vec::new(),
+            };
+            let guard_word_outcome = word::store_word(self.conn, &guard_word)?;
+
+            // Build CALL node to compute condition
+            let call_node = NodeCanon {
+                kind: NodeKind::Call,
+                out: vec![TypeTag::I64.as_atom().to_string()],
+                inputs: self
+                    .param_inputs
+                    .iter()
+                    .take(ginfo.params.len())
+                    .copied()
+                    .collect(),
+                vals: Vec::new(),
+                deps: Vec::new(),
+                effects: Vec::new(),
+                payload: NodePayload::Word(guard_word_outcome.cid),
+            };
+            let call_outcome = node::store_node(self.conn, &call_node)?;
+
+            // Success branch: literal 1 (ignored), ensures unified out type
+            let lit_node = NodeCanon {
+                kind: NodeKind::Lit,
+                out: vec![TypeTag::I64.as_atom().to_string()],
+                inputs: Vec::new(),
+                vals: Vec::new(),
+                deps: Vec::new(),
+                effects: Vec::new(),
+                payload: NodePayload::LitI64(1),
+            };
+            let lit_outcome = node::store_node(self.conn, &lit_node)?;
+
+            // Failure branch: DEOPT
+            let deopt_node = NodeCanon {
+                kind: NodeKind::Deopt,
+                out: vec![TypeTag::Unit.as_atom().to_string()],
+                inputs: Vec::new(),
+                vals: Vec::new(),
+                deps: Vec::new(),
+                effects: Vec::new(),
+                payload: NodePayload::Deopt,
+            };
+            let deopt_outcome = node::store_node(self.conn, &deopt_node)?;
+
+            // IF node consumes condition and selects branch (ignored output)
+            let if_node = NodeCanon {
+                kind: NodeKind::If,
+                out: vec![TypeTag::I64.as_atom().to_string()],
+                inputs: vec![NodeInput {
+                    cid: call_outcome.cid,
+                    port: 0,
+                }],
+                vals: Vec::new(),
+                deps: Vec::new(),
+                effects: Vec::new(),
+                payload: NodePayload::If {
+                    true_cont: NodeInput {
+                        cid: lit_outcome.cid,
+                        port: 0,
+                    },
+                    false_cont: NodeInput {
+                        cid: deopt_outcome.cid,
+                        port: 0,
+                    },
+                },
+            };
+            let if_outcome = node::store_node(self.conn, &if_node)?;
+            deps.push(NodeInput {
+                cid: if_outcome.cid,
+                port: 0,
+            });
+        }
+
         let mut return_out_types = Vec::new();
         for domain in &domains {
             return_out_types.push(types::token_tag_for_domain(*domain).as_atom().to_string());
@@ -726,6 +1064,7 @@ impl<'conn> GraphBuilder<'conn> {
 
         // Leave the final results on the stack for inspection, but reset tracking.
         self.param_types.clear();
+        self.param_inputs.clear();
         self.accumulated_effects.clear();
         self.effect_frontier.clear();
         self.token_pool.clear();
@@ -1058,6 +1397,112 @@ mod tests {
         let mut cid = [0u8; 32];
         cid.copy_from_slice(arr);
         assert_eq!(cid, prim_node_cid);
+        Ok(())
+    }
+
+    #[test]
+    fn dispatch_lowers_guard_graphs() -> Result<()> {
+        let conn = Connection::open_in_memory()?;
+        store::install_schema(&conn)?;
+
+        let mut builder = GraphBuilder::new(&conn);
+
+        // Guard that always fails.
+        builder.begin_guard(&[])?;
+        builder.push_lit_i64(0)?;
+        let guard_false = builder.finish_guard(&[], &[TypeTag::I64], Some("demo/guard_false"))?;
+
+        // Guard that always passes.
+        builder.begin_guard(&[])?;
+        builder.push_lit_i64(1)?;
+        let guard_true = builder.finish_guard(&[], &[TypeTag::I64], Some("demo/guard_true"))?;
+
+        // Candidate returning 10 but gated by the failing guard.
+        builder.begin_word(&[TypeTag::I64])?;
+        builder.drop()?;
+        builder.push_lit_i64(10)?;
+        builder.attach_guard(guard_false);
+        let word_false = builder.finish_word(
+            &[TypeTag::I64],
+            &[TypeTag::I64],
+            Some("demo/false_candidate"),
+        )?;
+
+        // Candidate returning 20 gated by the passing guard.
+        builder.begin_word(&[TypeTag::I64])?;
+        builder.drop()?;
+        builder.push_lit_i64(20)?;
+        builder.attach_guard(guard_true);
+        let word_true = builder.finish_word(
+            &[TypeTag::I64],
+            &[TypeTag::I64],
+            Some("demo/true_candidate"),
+        )?;
+
+        let info_false = crate::word::load_word_info(&conn, &word_false)?;
+        let info_true = crate::word::load_word_info(&conn, &word_true)?;
+
+        builder.begin_word(&[TypeTag::I64])?;
+        let specs = [
+            DispatchSpec {
+                word: word_false,
+                params: &info_false.params,
+                results: &info_false.results,
+                guards: &info_false.guards,
+                effect_mask: info_false.effect_mask,
+            },
+            DispatchSpec {
+                word: word_true,
+                params: &info_true.params,
+                results: &info_true.results,
+                guards: &info_true.guards,
+                effect_mask: info_true.effect_mask,
+            },
+        ];
+        let dispatch_cid = builder.apply_dispatch(&specs)?;
+        let select_word =
+            builder.finish_word(&[TypeTag::I64], &[TypeTag::I64], Some("demo/select"))?;
+
+        // Inspect dispatch payload; guard inputs should be materialised.
+        let (_kind, cbor) = crate::load_object_cbor(&conn, &dispatch_cid)?;
+        let node_val: CborValue = serde_cbor::from_slice(&cbor)?;
+        let payload = match node_val {
+            CborValue::Array(ref items) if items.len() == 6 => &items[5],
+            other => bail!("unexpected dispatch encoding: {other:?}"),
+        };
+        match payload {
+            CborValue::Array(cases) => {
+                assert_eq!(cases.len(), 2);
+                for (idx, case) in cases.iter().enumerate() {
+                    match case {
+                        CborValue::Array(parts) if parts.len() == 4 => {
+                            let guard_inputs = &parts[2];
+                            let guard_cids = &parts[3];
+                            match (guard_inputs, guard_cids) {
+                                (CborValue::Array(inputs), CborValue::Array(cids)) => {
+                                    assert_eq!(
+                                        inputs.len(),
+                                        cids.len(),
+                                        "guard metadata count mismatch for case {idx}"
+                                    );
+                                    assert!(
+                                        !inputs.is_empty(),
+                                        "expected lowered guard inputs for case {idx}"
+                                    );
+                                }
+                                other => bail!("unexpected guard payload structure: {other:?}"),
+                            }
+                        }
+                        other => bail!("unexpected dispatch case layout: {other:?}"),
+                    }
+                }
+            }
+            other => bail!("dispatch payload must be array, got {other:?}"),
+        }
+
+        // Runtime dispatch should skip the failing guard and pick the passing candidate.
+        let outputs = run_word(&conn, &select_word, &[Value::I64(5)])?;
+        assert_eq!(outputs.last(), Some(&Value::I64(20)));
         Ok(())
     }
 

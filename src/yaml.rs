@@ -367,9 +367,12 @@ pub enum CatalogItem {
     Snapshot {
         values: BTreeMap<String, Value>,
     },
+    Overloads {
+        entries: Vec<OverloadSpec>,
+    },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum WordOp {
     Prim(String),
     Word(String),
@@ -422,6 +425,7 @@ fn decode_catalog_entry(symbol: &str, node: Node) -> Result<CatalogItem> {
             "prim" => decode_prim_entry(*value),
             "word" => decode_word_entry(symbol, *value),
             "guard" => decode_guard_entry(symbol, *value),
+            "overloads" => decode_overloads_entry(*value),
             "snapshot" => decode_snapshot_entry(*value),
             other => bail!("unsupported catalog tag `{other}`"),
         },
@@ -430,6 +434,47 @@ fn decode_catalog_entry(symbol: &str, node: Node) -> Result<CatalogItem> {
             other
         ),
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct OverloadSpec {
+    pub params: Vec<TypeTag>,
+    pub results: Vec<TypeTag>,
+    pub guards: Vec<String>,
+    pub stack: Vec<WordOp>,
+}
+
+fn decode_overloads_entry(node: Node) -> Result<CatalogItem> {
+    // Require a sequence of overload entries; labels are not supported to avoid ambiguity.
+    let list = match node {
+        Node::Sequence(items) => items,
+        other => bail!("overloads entry must be sequence, found {:?}", other),
+    };
+    let mut entries: Vec<OverloadSpec> = Vec::with_capacity(list.len());
+    for item in list {
+        let map = match item {
+            Node::Mapping(map) => map,
+            Node::Tagged { tag, value } if tag == "word" => match *value {
+                Node::Mapping(map) => map,
+                other => bail!("!word payload must be mapping, found {:?}", other),
+            },
+            other => bail!("overload spec must be mapping or !word, found {:?}", other),
+        };
+        let params = parse_type_list(map.get("params"))?;
+        let results = parse_type_list(map.get("results"))?;
+        let guards = parse_string_list(map.get("guards"))?;
+        let stack_node = map
+            .get("stack")
+            .ok_or_else(|| anyhow!("overload entry missing `stack` field"))?;
+        let stack = decode_word_ops(stack_node)?;
+        entries.push(OverloadSpec {
+            params,
+            results,
+            guards,
+            stack,
+        });
+    }
+    Ok(CatalogItem::Overloads { entries })
 }
 
 fn decode_effect_entry(node: Node) -> Result<CatalogItem> {
@@ -654,6 +699,17 @@ demo:
     results: [i64]
     stack:
       - !lit -1
+  add: !overloads
+    - !word
+      params: [i64, i64]
+      results: [i64]
+      stack:
+        - !prim core/add_i64
+    - !word
+      params: [text, text]
+      results: [text]
+      stack:
+        - !word text/concat
   counter: !snapshot
     demo.counter: !i64 0
   square: !word
@@ -669,6 +725,10 @@ demo:
         assert!(matches!(
             demo_entries.get("always_true"),
             Some(CatalogItem::Guard { .. })
+        ));
+        assert!(matches!(
+            demo_entries.get("add"),
+            Some(CatalogItem::Overloads { .. })
         ));
         Ok(())
     }

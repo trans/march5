@@ -60,19 +60,6 @@ pub fn run_word(conn: &Connection, word_cid: &[u8; 32], args: &[Value]) -> Resul
     run_word_with_info(conn, &info, args)
 }
 
-fn evaluate_guards(conn: &Connection, info: &crate::word::WordInfo, args: &[Value]) -> Result<()> {
-    for guard_cid in &info.guards {
-        if !run_guard(conn, guard_cid, args)? {
-            bail!(
-                "guard {} failed for word {}",
-                cid::to_hex(guard_cid),
-                cid::to_hex(&info.root)
-            );
-        }
-    }
-    Ok(())
-}
-
 fn run_guard(conn: &Connection, guard_cid: &[u8; 32], args: &[Value]) -> Result<bool> {
     let info = guard::load_guard_info(conn, guard_cid)?;
     if info.params.len() > args.len() {
@@ -108,7 +95,6 @@ fn run_guard(conn: &Connection, guard_cid: &[u8; 32], args: &[Value]) -> Result<
     }
 
     let mut cache: HashMap<[u8; 32], Vec<Value>> = HashMap::new();
-    let arg_clone = guard_args.to_vec();
     let word_like = crate::word::WordInfo {
         root: info.root,
         params: info.params.clone(),
@@ -117,7 +103,7 @@ fn run_guard(conn: &Connection, guard_cid: &[u8; 32], args: &[Value]) -> Result<
         effect_mask: info.effect_mask,
         guards: Vec::new(),
     };
-    let outputs = eval_return(conn, &info.root, &mut cache, &arg_clone, &word_like)?;
+    let outputs = eval_return(conn, &info.root, &mut cache, guard_args, &word_like)?;
     if outputs.len() != 1 {
         bail!(
             "guard {} returned {} value(s)",
@@ -250,9 +236,24 @@ fn run_word_with_info(
             );
         }
     }
-    evaluate_guards(conn, info, args)?;
     let mut cache: HashMap<[u8; 32], Vec<Value>> = HashMap::new();
-    let outputs = eval_return(conn, &info.root, &mut cache, args, info)?;
+    let outputs = match eval_return(conn, &info.root, &mut cache, args, info) {
+        Ok(values) => values,
+        Err(err) if is_deopt_error(&err) && !info.guards.is_empty() => {
+            let guard_list = info
+                .guards
+                .iter()
+                .map(cid::to_hex)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "guard deopt triggered while executing word {} (guards: {})",
+                cid::to_hex(&info.root),
+                guard_list
+            );
+        }
+        Err(err) => return Err(err),
+    };
     let token_domains = wrap_token_domains(&word_token_domains(info));
     let expected_len = info.results.len() + token_domains.len();
     if outputs.len() != expected_len {
@@ -302,6 +303,13 @@ impl NodeInputRecord {
     fn port(&self) -> u32 {
         self.1
     }
+}
+
+struct DispatchCaseRecord {
+    type_keys: Vec<[u8; 32]>,
+    target: NodeInputRecord,
+    guard_inputs: Vec<NodeInputRecord>,
+    guard_cids: Vec<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -480,6 +488,53 @@ fn eval_node(
             let matches = input_value.type_tag() == expected_tag;
             let branch = if matches { match_input } else { else_input };
             vec![eval_input(conn, &branch, cache, args)?]
+        }
+        14 => {
+            let cases = cbor_to_dispatch_payload(&payload_val)?;
+            let arg_types: Vec<TypeTag> = inputs.iter().map(|v| v.type_tag()).collect();
+            'cases: for case in cases {
+                if case.type_keys.len() != arg_types.len() {
+                    continue;
+                }
+                let mut ok = true;
+                for (key, actual) in case.type_keys.iter().zip(arg_types.iter()) {
+                    let expected = decode_guard_type_key(key)?;
+                    if &expected != actual {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                if !case.guard_inputs.is_empty() {
+                    for guard_input in &case.guard_inputs {
+                        match eval_input(conn, guard_input, cache, args) {
+                            Ok(Value::I64(n)) if n != 0 => {}
+                            Ok(Value::I64(_)) => continue 'cases,
+                            Ok(other) => {
+                                bail!("dispatch guard produced non-i64 {:?}", other.type_tag())
+                            }
+                            Err(err) if is_deopt_error(&err) => continue 'cases,
+                            Err(err) => return Err(err),
+                        }
+                    }
+                } else {
+                    // Legacy dispatch nodes without lowered guard inputs.
+                    for gid in &case.guard_cids {
+                        if !run_guard(conn, gid, &inputs)? {
+                            continue 'cases;
+                        }
+                    }
+                }
+                match eval_input(conn, &case.target, cache, args) {
+                    Ok(Value::Tuple(values)) => return Ok(values),
+                    Ok(other) => return Ok(vec![other]),
+                    Err(err) if is_deopt_error(&err) => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            bail!("deopt triggered")
         }
         13 => bail!("deopt triggered"),
         other => bail!("unsupported node kind tag `{other}` in runner"),
@@ -710,6 +765,76 @@ fn decode_guard_type_key(bytes: &[u8]) -> Result<TypeTag> {
     let slice = &bytes[..end];
     let atom = str::from_utf8(slice)?;
     TypeTag::from_atom(atom)
+}
+
+fn is_deopt_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("deopt triggered")
+}
+
+fn cbor_to_dispatch_payload(value: &CborValue) -> Result<Vec<DispatchCaseRecord>> {
+    match value {
+        CborValue::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for case in items {
+                match case {
+                    CborValue::Array(parts) if (3..=4).contains(&parts.len()) => {
+                        let type_keys = match &parts[0] {
+                            CborValue::Array(keys) => {
+                                let mut v = Vec::with_capacity(keys.len());
+                                for k in keys {
+                                    let key = cbor_to_bytes32(k, "DISPATCH type key")?;
+                                    v.push(key);
+                                }
+                                v
+                            }
+                            other => bail!("DISPATCH type_keys should be array, got {other:?}"),
+                        };
+                        let target = cbor_to_input_record(&parts[1], "DISPATCH target")?;
+                        let (guard_inputs, guard_cids) = if parts.len() == 4 {
+                            let guard_inputs =
+                                cbor_to_inputs(&parts[2], "DISPATCH guard inputs (lowered)")?;
+                            let guard_cids = match &parts[3] {
+                                CborValue::Array(items) => {
+                                    let mut v = Vec::with_capacity(items.len());
+                                    for g in items {
+                                        let gid = cbor_to_bytes32(g, "DISPATCH guard qid")?;
+                                        v.push(gid);
+                                    }
+                                    v
+                                }
+                                other => {
+                                    bail!("DISPATCH guard CIDs should be array, got {other:?}")
+                                }
+                            };
+                            (guard_inputs, guard_cids)
+                        } else {
+                            let guard_cids = match &parts[2] {
+                                CborValue::Array(items) => {
+                                    let mut v = Vec::with_capacity(items.len());
+                                    for g in items {
+                                        let gid = cbor_to_bytes32(g, "DISPATCH guard qid")?;
+                                        v.push(gid);
+                                    }
+                                    v
+                                }
+                                other => bail!("DISPATCH guards should be array, got {other:?}"),
+                            };
+                            (Vec::new(), guard_cids)
+                        };
+                        out.push(DispatchCaseRecord {
+                            type_keys,
+                            target,
+                            guard_inputs,
+                            guard_cids,
+                        });
+                    }
+                    other => bail!("DISPATCH case malformed: {other:?}"),
+                }
+            }
+            Ok(out)
+        }
+        other => bail!("DISPATCH payload must be array, found {other:?}"),
+    }
 }
 
 fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) -> Result<Value> {

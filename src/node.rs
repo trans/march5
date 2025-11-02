@@ -42,7 +42,18 @@ pub enum NodePayload {
         else_cont: NodeInput,
     },
     Deopt,
+    Dispatch {
+        cases: Vec<DispatchCase>,
+    },
     Empty,
+}
+
+#[derive(Clone, Debug)]
+pub struct DispatchCase {
+    pub type_keys: Vec<[u8; 32]>,
+    pub target: NodeInput,
+    pub guard_inputs: Vec<NodeInput>,
+    pub guard_cids: Vec<[u8; 32]>,
 }
 
 /// Minimal node kinds currently implemented.
@@ -62,6 +73,7 @@ pub enum NodeKind {
     Token,
     Guard,
     Deopt,
+    Dispatch,
 }
 
 /// Fully described node ready for canonical encoding.
@@ -122,6 +134,7 @@ fn node_kind_tag(kind: NodeKind) -> u8 {
         NodeKind::Token => 11,
         NodeKind::Guard => 12,
         NodeKind::Deopt => 13,
+        NodeKind::Dispatch => 14,
     }
 }
 
@@ -265,6 +278,31 @@ fn encode_payload(buf: &mut Vec<u8>, node: &NodeCanon) -> Result<()> {
             }
             _ => bail!("GUARD node requires guard payload"),
         },
+        NodeKind::Dispatch => match node.payload {
+            NodePayload::Dispatch { ref cases } => {
+                // Encode as array of candidates; each candidate is [type_keys[], target, guard_inputs[], guard_cids[]]
+                push_array(buf, cases.len() as u64);
+                for case in cases {
+                    push_array(buf, 4);
+                    // type_keys
+                    push_array(buf, case.type_keys.len() as u64);
+                    for key in &case.type_keys {
+                        push_bytes(buf, key);
+                    }
+                    // target
+                    encode_input(buf, &case.target);
+                    // guard inputs
+                    encode_input_list(buf, &case.guard_inputs);
+                    // guard CIDs
+                    push_array(buf, case.guard_cids.len() as u64);
+                    for gid in &case.guard_cids {
+                        push_bytes(buf, gid);
+                    }
+                }
+                return Ok(());
+            }
+            _ => bail!("DISPATCH node requires dispatch payload"),
+        },
     }
 }
 
@@ -343,6 +381,17 @@ fn validate_node(node: &NodeCanon) -> Result<()> {
         NodeKind::Guard => match node.payload {
             NodePayload::Guard { .. } => Ok(()),
             _ => bail!("GUARD node requires guard payload"),
+        },
+        NodeKind::Dispatch => match node.payload {
+            NodePayload::Dispatch { ref cases } => {
+                for case in cases {
+                    if case.guard_inputs.len() != case.guard_cids.len() {
+                        bail!("DISPATCH guard inputs/cids length mismatch");
+                    }
+                }
+                Ok(())
+            }
+            _ => bail!("DISPATCH node requires dispatch payload"),
         },
         NodeKind::Deopt => match node.payload {
             NodePayload::Deopt => Ok(()),
