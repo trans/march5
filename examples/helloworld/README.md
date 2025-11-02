@@ -2,6 +2,8 @@
 
 ## helloworld.march5.db
 
+Example database at `examples/helloworld.march5.db` demonstrates the CLI flow.
+
 A minimal database containing:
 
 - `org.march.helloworld/hello` word returning the literal `42` (`i64`).

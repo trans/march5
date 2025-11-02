@@ -1,35 +1,35 @@
-Interaction-Nets Plan (Agents + Rules)
+# Interaction-Nets Design (Agents + Rules)
 
-Overview
+## Overview
 - Core language is a set of agent kinds (nodes with ports) and rewiring rules.
 - A lean Rust reducer applies rules to active pairs (principal–principal), reducing nets.
 - Programs (“words”) are nets; reduction bottoms out at primitives implemented in Rust.
 - Higher-level syntax (YAML, S‑expr, Forth-like) is sugar that builds nets and definitions.
 
-Key Concepts
+## Key Concepts
 - Agent: named kind with ports (one principal, N auxiliaries).
 - Net: agents + wires connecting ports; entry indicates a runnable net.
 - Rule: LHS pattern (active pair) ⇒ rewire (construct/rewire a sub-net), optional side‑effects.
 - Primitive: special agent whose rule executes native code and produces replacement wiring/values.
 - Namespaces: group definitions (agents, rules, words, types, effects, guards) with imports/exports.
 
-Serialization (objects)
+## Serialization (objects)
 - agent: { kind: "agent", name, ports: [principal, ...aux], doc? }
 - rule: { kind: "rule", lhs: [a, b], rewire: ... , side_effect? }
 - inet: { kind: "inet", agents: [...], wires: [...], entry }
 Store canonically in CBOR; address by 32‑byte CID; name via name_index.
 
-Reducer
+## Reducer
 - Worklist of active pairs; for each: match rule, apply rewiring, enqueue new pairs.
 - AOT: reduce nets to normal form and persist; compiled code keyed by reduced CID.
 - JIT/mini‑inet: reduce locally around calls; primitives bottom out via Rust.
 
-Existing Pieces We Reuse
+## Existing Pieces We Reuse
 - Storage and canonical encoders for effects, words, nodes; SQLite schema and name index.
 - Guards, effects (token domains), dispatch, apply/call, return, pair/unpair.
 - CLI + YAML catalog; lightweight web UI.
 
-Incremental Path
+## Incremental Path
 1) Data/API
    - Add inet.rs with AgentCanon, RuleCanon, Net struct; encoders + store/load helpers.
    - New object kinds: "agent", "rule", "inet".
@@ -46,12 +46,12 @@ Incremental Path
    - CRUD for Agent/Rule/Word/Type/Effect/Guard/Const/Var/Namespace.
    - Net visualization + stepper; JSON endpoints.
 
-Notes
+## Notes
 - Result-type dispatch is supported if candidates agree on output shape at use sites; token domains unify via effect masks.
 - Unconnected ports should be considered invalid unless explicitly permitted by an agent’s rule.
 - Primitives bottom out via Rust FFI; they return agents/wiring (pure) or perform side effects guarded by tokens.
 
-Current Status (2025‑03‑05)
+## Current Status (2025‑03‑05)
 - Implemented overloads + guard lowering on the graph side, plus a Dispatch node with interpreter support.
 - YAML `!overloads` (sequence form) expands to `<base>#<params->results>`; builder resolves base symbols by types or synthesizes Dispatch when multiple/guarded.
 - Added inet storage + reducer scaffold:
@@ -60,7 +60,7 @@ Current Status (2025‑03‑05)
   - DSL supports: `(seq …)`, `(connect (A port) (B port))`, `(disconnect …)`, `(delete A B)`, `(new KIND alias (ports…))`.
   - Example rule in DB reduces `(pair, unpair)`; tests cover rewiring and a disconnect→connect scenario.
 
-Next Session Plan
+## Next Session Plan
 1) Reducer Rules (core semantics)
    - Add guard.type + if + deopt rules in DSL (choose continuation; terminal deopt).
    - Add call/apply rules to rewire into entry subnets (bridge with current CALL/APPLY during bootstrap).
@@ -75,7 +75,7 @@ Next Session Plan
    - POST forms to create Agents/Rules; list + detail pages.
    - Net visualizer and stepper once reducer has guard/if/deopt.
 
-File Pointers
+## File Pointers
 - Reducer + DSL: `src/inet.rs`
 - Dispatch execution: `src/interp.rs` (kind 14)
 - Overload resolution (builder path): `src/main.rs`
