@@ -7,7 +7,7 @@ use serde_bytes::ByteBuf;
 
 use crate::cbor::{push_array, push_bytes, push_text};
 use crate::types::{EffectMask, TypeTag, effect_mask};
-use crate::{cid, store};
+use crate::{cid, db};
 
 /// Structured representation of a primitive prior to encoding.
 pub struct PrimCanon<'a> {
@@ -65,17 +65,13 @@ pub fn encode(prim: &PrimCanon) -> Vec<u8> {
 pub fn store_prim(conn: &Connection, prim: &PrimCanon) -> Result<PrimStoreOutcome> {
     let cbor = encode(prim);
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "prim", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "prim", &cbor)?;
     Ok(PrimStoreOutcome { cid, inserted })
 }
 
 /// Load primitive metadata required by the graph builder.
 pub fn load_prim_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<PrimInfo> {
-    let cbor: Vec<u8> = conn.query_row(
-        "SELECT cbor FROM object WHERE cid = ?1 AND kind = 'prim'",
-        [cid_bytes.as_slice()],
-        |row| row.get(0),
-    )?;
+    let cbor = db::load_cbor_for_kind(conn, cid_bytes, "prim")?;
     let PrimRecord(tag, root, params_raw, results_raw, effects_raw, mask_opt) =
         serde_cbor::from_slice(&cbor).with_context(|| "failed to decode primitive CBOR payload")?;
     if tag != 0 {
@@ -181,7 +177,7 @@ mod tests {
     #[test]
     fn roundtrip_prim_info() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        crate::store::install_schema(&conn)?;
+        crate::db::install_schema(&conn)?;
 
         let params = [TypeTag::I64, TypeTag::I64];
         let results = [TypeTag::I64];
@@ -212,7 +208,7 @@ mod tests {
             effect_mask: effect_mask::STATE_WRITE,
         };
         let conn = Connection::open_in_memory()?;
-        crate::store::install_schema(&conn)?;
+        crate::db::install_schema(&conn)?;
         let outcome = store_prim(&conn, &prim)?;
         let info = load_prim_info(&conn, &outcome.cid)?;
         assert_eq!(info.effects, effects);

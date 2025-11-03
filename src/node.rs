@@ -6,7 +6,7 @@ use anyhow::{Result, bail};
 use rusqlite::Connection;
 
 use crate::cbor::{push_array, push_bytes, push_i64, push_text, push_u32};
-use crate::{cid, store};
+use crate::{cid, db};
 
 /// Reference to another node's output.
 #[derive(Clone, Copy, Debug)]
@@ -114,7 +114,7 @@ pub fn encode(node: &NodeCanon) -> Result<Vec<u8>> {
 pub fn store_node(conn: &Connection, node: &NodeCanon) -> Result<NodeStoreOutcome> {
     let cbor = encode(node)?;
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "node", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "node", &cbor)?;
     Ok(NodeStoreOutcome { cid, inserted })
 }
 

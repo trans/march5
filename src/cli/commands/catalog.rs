@@ -261,15 +261,10 @@ fn apply_overloaded_symbol(
     conn: &Connection,
     base_name: &str,
 ) -> Result<()> {
-    let sql = "SELECT name, cid FROM name_index WHERE scope = 'word' AND name LIKE ?1";
-    let pattern = format!("{base_name}#%");
-    let mut stmt = conn.prepare(sql)?;
-    let mut rows = stmt.query([pattern.as_str()])?;
-
     let mut candidates: Vec<([u8; 32], Vec<TypeTag>, Vec<TypeTag>)> = Vec::new();
-    while let Some(row) = rows.next()? {
-        let cid_blob: Vec<u8> = row.get(1)?;
-        let cid = cid::from_slice(&cid_blob)?;
+    let prefix = format!("{base_name}#");
+    for entry in march5::db::list_names(conn, "word", Some(&prefix))? {
+        let cid = entry.cid;
         let info = march5::word::load_word_info(conn, &cid)?;
         candidates.push((cid, info.params.clone(), info.results.clone()));
     }

@@ -5,7 +5,7 @@ use serde_bytes::ByteBuf;
 
 use crate::cbor::{push_array, push_bytes, push_text};
 use crate::types::{EffectMask, TypeTag, effect_mask};
-use crate::{cid, store};
+use crate::{cid, db};
 
 #[derive(Clone, Debug)]
 pub struct GuardCanon {
@@ -52,7 +52,7 @@ pub fn encode(guard: &GuardCanon) -> Vec<u8> {
 pub fn store_guard(conn: &Connection, guard: &GuardCanon) -> Result<GuardStoreOutcome> {
     let cbor = encode(guard);
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "guard", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "guard", &cbor)?;
     Ok(GuardStoreOutcome { cid, inserted })
 }
 
@@ -66,11 +66,7 @@ pub struct GuardInfo {
 }
 
 pub fn load_guard_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<GuardInfo> {
-    let cbor: Vec<u8> = conn.query_row(
-        "SELECT cbor FROM object WHERE cid = ?1 AND kind = 'guard'",
-        [cid_bytes.as_slice()],
-        |row| row.get(0),
-    )?;
+    let cbor = db::load_cbor_for_kind(conn, cid_bytes, "guard")?;
     let GuardRecord(tag, root_buf, params_raw, results_raw, effects_raw, mask_opt) =
         serde_cbor::from_slice(&cbor)?;
     if tag != 7 {

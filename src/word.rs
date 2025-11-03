@@ -7,7 +7,7 @@ use serde_bytes::ByteBuf;
 
 use crate::cbor::{push_array, push_bytes, push_text};
 use crate::types::{EffectMask, TypeTag, effect_mask};
-use crate::{cid, store};
+use crate::{cid, db};
 
 /// Structured word definition before encoding.
 #[derive(Clone, Debug)]
@@ -66,7 +66,7 @@ pub fn encode(word: &WordCanon) -> Vec<u8> {
 pub fn store_word(conn: &Connection, word: &WordCanon) -> Result<WordStoreOutcome> {
     let cbor = encode(word);
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "word", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "word", &cbor)?;
     Ok(WordStoreOutcome { cid, inserted })
 }
 
@@ -83,11 +83,7 @@ pub struct WordInfo {
 
 /// Load word metadata from storage.
 pub fn load_word_info(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<WordInfo> {
-    let cbor: Vec<u8> = conn.query_row(
-        "SELECT cbor FROM object WHERE cid = ?1 AND kind = 'word'",
-        [cid_bytes.as_slice()],
-        |row| row.get(0),
-    )?;
+    let cbor = db::load_cbor_for_kind(conn, cid_bytes, "word")?;
     let WordRecord(tag, root_buf, params_raw, results_raw, effects_raw, mask_opt, guards_raw) =
         serde_cbor::from_slice(&cbor)?;
     if tag != 1 {
@@ -195,7 +191,7 @@ mod tests {
     #[test]
     fn roundtrip_word_info() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        crate::store::install_schema(&conn)?;
+        crate::db::install_schema(&conn)?;
 
         let word = WordCanon {
             root: [0x22; 32],

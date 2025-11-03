@@ -1,8 +1,8 @@
 use anyhow::{Result, bail};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
-use crate::cbor::{push_array, push_bytes, push_map, push_text};
-use crate::{cid, store};
+use crate::cbor::{push_array, push_map, push_text};
+use crate::{cid, db};
 
 #[derive(Clone, Debug)]
 pub struct AgentCanon<'a> {
@@ -73,14 +73,14 @@ pub struct RuleStoreOutcome {
 pub fn store_agent(conn: &Connection, agent: &AgentCanon) -> Result<AgentStoreOutcome> {
     let cbor = encode_agent(agent);
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "agent", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "agent", &cbor)?;
     Ok(AgentStoreOutcome { cid, inserted })
 }
 
 pub fn store_rule(conn: &Connection, rule: &RuleCanon) -> Result<RuleStoreOutcome> {
     let cbor = encode_rule(rule);
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "rule", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "rule", &cbor)?;
     Ok(RuleStoreOutcome { cid, inserted })
 }
 
@@ -268,10 +268,7 @@ pub struct Reducer {
 impl Reducer {
     pub fn new(conn: &Connection) -> Result<Self> {
         let mut rules = std::collections::HashMap::new();
-        let mut stmt = conn.prepare("SELECT cbor FROM object WHERE kind = 'rule'")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let cbor: Vec<u8> = row.get(0)?;
+        for cbor in db::load_all_cbor_for_kind(conn, "rule")? {
             // Decode minimal fields: kind, lhs (array of two), rewire
             let value: serde_cbor::Value = serde_cbor::from_slice(&cbor)?;
             let map = match value {
@@ -619,7 +616,7 @@ mod tests {
         let bytes = encode_agent(&agent);
         assert!(!bytes.is_empty());
         let conn = Connection::open_in_memory()?;
-        crate::store::install_schema(&conn)?;
+        crate::db::install_schema(&conn)?;
         let out = store_agent(&conn, &agent)?;
         assert!(!out.cid.iter().all(|b| *b == 0));
         Ok(())
@@ -635,7 +632,7 @@ mod tests {
         let bytes = encode_rule(&rule);
         assert!(!bytes.is_empty());
         let conn = Connection::open_in_memory()?;
-        crate::store::install_schema(&conn)?;
+        crate::db::install_schema(&conn)?;
         let out = store_rule(&conn, &rule)?;
         assert!(!out.cid.iter().all(|b| *b == 0));
         Ok(())
@@ -714,7 +711,7 @@ mod tests {
     #[test]
     fn reducer_applies_stored_pair_unpair_rule() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        crate::store::install_schema(&conn)?;
+        crate::db::install_schema(&conn)?;
         let rule = RuleCanon {
             lhs_a: "pair",
             lhs_b: "unpair",
@@ -791,7 +788,7 @@ mod tests {
     #[test]
     fn dsl_disconnect_then_connect() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        crate::store::install_schema(&conn)?;
+        crate::db::install_schema(&conn)?;
         // Rule: disconnect A.p then connect A.p to B.q and delete A/B
         let rule = RuleCanon {
             lhs_a: "X",
@@ -844,7 +841,7 @@ mod tests {
     #[test]
     fn dsl_guard_type_if_rewire() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        crate::store::install_schema(&conn)?;
+        crate::db::install_schema(&conn)?;
         // Rule: when (gtype, if) meet, connect match->true and else->false, then delete both
         let rule = RuleCanon {
             lhs_a: "gtype",
@@ -916,7 +913,7 @@ mod tests {
     #[test]
     fn dsl_deopt_delete() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        crate::store::install_schema(&conn)?;
+        crate::db::install_schema(&conn)?;
         // Rule: when (foo, deopt) meet, delete both (disconnect all ports)
         let rule = RuleCanon {
             lhs_a: "foo",

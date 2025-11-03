@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::cbor::{push_array, push_bytes, push_text};
-use crate::{cid, store};
+use crate::{cid, db};
 
 /// A single symbol exported by an interface.
 #[derive(Clone, Debug)]
@@ -40,7 +40,7 @@ pub fn encode(iface: &IfaceCanon) -> Vec<u8> {
 pub fn store_iface(conn: &Connection, iface: &IfaceCanon) -> Result<IfaceStoreOutcome> {
     let cbor = encode(iface);
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "iface", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "iface", &cbor)?;
     Ok(IfaceStoreOutcome { cid, inserted })
 }
 
@@ -102,7 +102,7 @@ fn encode_names(buf: &mut Vec<u8>, names: &[IfaceSymbol]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store;
+    use crate::db;
     use crate::types::{TypeTag, effect_mask};
     use crate::word::{WordCanon, store_word};
 
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn derive_interface_from_words() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
         let effects = vec![[0xAA; 32]];
         let word = WordCanon {
             root: [0x44; 32],

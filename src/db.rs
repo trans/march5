@@ -155,3 +155,76 @@ pub fn load_object_cbor(conn: &Connection, cid: &[u8; 32]) -> Result<(String, Ve
         bail!("object `{}` not found", crate::cid::to_hex(cid));
     }
 }
+
+/// Load a typed object's CBOR payload, asserting the stored kind matches `expected_kind`.
+pub fn load_cbor_for_kind(
+    conn: &Connection,
+    cid: &[u8; 32],
+    expected_kind: &str,
+) -> Result<Vec<u8>> {
+    let (kind, cbor) = load_object_cbor(conn, cid)?;
+    if kind != expected_kind {
+        bail!(
+            "object `{}` has kind `{kind}` (expected `{expected_kind}`)",
+            crate::cid::to_hex(cid)
+        );
+    }
+    Ok(cbor)
+}
+
+/// Return all CBOR payloads for rows in `object` matching `kind`.
+pub fn load_all_cbor_for_kind(conn: &Connection, kind: &str) -> Result<Vec<Vec<u8>>> {
+    let mut stmt = conn.prepare("SELECT cbor FROM object WHERE kind = ?1 ORDER BY cid")?;
+    let mut rows = stmt.query(params![kind])?;
+    let mut blobs = Vec::new();
+    while let Some(row) = rows.next()? {
+        blobs.push(row.get(0)?);
+    }
+    Ok(blobs)
+}
+
+/// Convenience wrapper for `SELECT COUNT(*) FROM object WHERE kind = ?`.
+pub fn count_objects_of_kind(conn: &Connection, kind: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM object WHERE kind = ?1",
+        params![kind],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
+/// Entry returned when listing names scoped within the object store.
+pub struct NameEntry {
+    pub name: String,
+    pub cid: [u8; 32],
+}
+
+/// List names registered in `name_index` by scope, optionally filtering by prefix.
+pub fn list_names(conn: &Connection, scope: &str, prefix: Option<&str>) -> Result<Vec<NameEntry>> {
+    let mut entries = Vec::new();
+    if let Some(prefix) = prefix {
+        let pattern = format!("{prefix}%");
+        let mut stmt = conn.prepare(
+            "SELECT name, cid FROM name_index \
+             WHERE scope = ?1 AND name LIKE ?2 ORDER BY name",
+        )?;
+        let mut rows = stmt.query(params![scope, pattern])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let cid = crate::cid::from_slice(&blob)?;
+            entries.push(NameEntry { name, cid });
+        }
+    } else {
+        let mut stmt =
+            conn.prepare("SELECT name, cid FROM name_index WHERE scope = ?1 ORDER BY name")?;
+        let mut rows = stmt.query(params![scope])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let cid = crate::cid::from_slice(&blob)?;
+            entries.push(NameEntry { name, cid });
+        }
+    }
+    Ok(entries)
+}

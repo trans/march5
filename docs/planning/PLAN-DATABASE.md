@@ -10,6 +10,7 @@
 - Add migration tooling once we stabilise schema changes (e.g., effect masks, transactions).
 - Capture schema documentation (tables, columns, relationships) in `docs/design` for new contributors.
 - Investigate lightweight indexing/search improvements for the web UI and CLI (`list` commands).
+- Consider centralising common SQL “query templates” (pre-prepared statements or helper helpers) so callers reuse them instead of embedding raw SQL.
 
 ## Design Considerations
 

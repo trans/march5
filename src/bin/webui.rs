@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use clap::Parser;
+use march5::db;
 use march5::prim::load_prim_info;
 use march5::word::load_word_info;
 use march5::{
@@ -10,7 +11,7 @@ use march5::{
     open_store,
 };
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde_bytes::ByteBuf;
 use serde_cbor::Value as CborValue;
@@ -141,21 +142,17 @@ fn fetch_named_json(db_path: &Path, scope: &str, label: &str, name: &str) -> Res
 
 fn list_scope_entries(db_path: &Path, scope: &str, prefix: Option<&str>) -> Result<String> {
     let conn = open_store(db_path)?;
-    let pattern = prefix
-        .map(|p| format!("{}%", p))
-        .unwrap_or_else(|| "%".to_string());
-    let mut stmt = conn.prepare(
-        "SELECT name, cid FROM name_index WHERE scope = ?1 AND name LIKE ?2 ORDER BY name",
-    )?;
-    let mut rows = stmt.query(params![scope, pattern])?;
-    let mut entries = Vec::new();
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
-        let cid_bytes = cid::from_slice(&blob)?;
-        entries.push(json!({ "name": name, "cid": cid::to_hex(&cid_bytes) }));
-    }
-    Ok(serde_json::to_string_pretty(&entries)?)
+    let entries = db::list_names(&conn, scope, prefix)?;
+    let json_entries: Vec<JsonValue> = entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "name": entry.name,
+                "cid": cid::to_hex(&entry.cid),
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string_pretty(&json_entries)?)
 }
 
 fn build_index_html(conn: &Connection) -> Result<String> {
@@ -326,18 +323,11 @@ const SEGMENT_ENCODE: &AsciiSet = &CONTROLS
     .add(b'}');
 
 fn collect_namespace_rows(conn: &Connection) -> Result<Vec<NamespaceRow>> {
-    let mut stmt =
-        conn.prepare("SELECT name, cid FROM name_index WHERE scope = 'namespace' ORDER BY name")?;
-    let rows = stmt.query_map([], |row| {
-        let name: String = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
-        Ok((name, blob))
-    })?;
-
+    let entries = db::list_names(conn, "namespace", None)?;
     let mut out = Vec::new();
-    for row in rows {
-        let (name, cid_blob) = row?;
-        let cid_bytes = cid::from_slice(&cid_blob)?;
+    for entry in entries {
+        let db::NameEntry { name, cid } = entry;
+        let cid_bytes = cid;
         let (_, cbor) = load_object_cbor(conn, &cid_bytes)?;
         let record: NamespaceRecord = serde_cbor::from_slice(&cbor)?;
         let iface_hex = cid::to_hex(&bytebuf_to_array(&record.iface)?);
@@ -374,18 +364,11 @@ fn collect_namespace_rows(conn: &Connection) -> Result<Vec<NamespaceRow>> {
 }
 
 fn collect_interface_rows(conn: &Connection) -> Result<Vec<InterfaceRow>> {
-    let mut stmt =
-        conn.prepare("SELECT name, cid FROM name_index WHERE scope = 'iface' ORDER BY name")?;
-    let rows = stmt.query_map([], |row| {
-        let name: String = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
-        Ok((name, blob))
-    })?;
-
+    let entries = db::list_names(conn, "iface", None)?;
     let mut out = Vec::new();
-    for row in rows {
-        let (name, cid_blob) = row?;
-        let cid_bytes = cid::from_slice(&cid_blob)?;
+    for entry in entries {
+        let db::NameEntry { name, cid } = entry;
+        let cid_bytes = cid;
         let (_, cbor) = load_object_cbor(conn, &cid_bytes)?;
         let record: InterfaceRecord = serde_cbor::from_slice(&cbor)?;
         let mut summaries = Vec::new();
@@ -415,18 +398,11 @@ fn collect_interface_rows(conn: &Connection) -> Result<Vec<InterfaceRow>> {
 }
 
 fn collect_word_rows(conn: &Connection) -> Result<Vec<WordRow>> {
-    let mut stmt =
-        conn.prepare("SELECT name, cid FROM name_index WHERE scope = 'word' ORDER BY name")?;
-    let rows = stmt.query_map([], |row| {
-        let name: String = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
-        Ok((name, blob))
-    })?;
-
+    let entries = db::list_names(conn, "word", None)?;
     let mut out = Vec::new();
-    for row in rows {
-        let (name, cid_blob) = row?;
-        let cid_bytes = cid::from_slice(&cid_blob)?;
+    for entry in entries {
+        let db::NameEntry { name, cid } = entry;
+        let cid_bytes = cid;
         let info = load_word_info(conn, &cid_bytes)?;
         let signature = format_signature(&info.params, &info.results);
         let effects = info
@@ -445,18 +421,11 @@ fn collect_word_rows(conn: &Connection) -> Result<Vec<WordRow>> {
 }
 
 fn collect_prim_rows(conn: &Connection) -> Result<Vec<PrimRow>> {
-    let mut stmt =
-        conn.prepare("SELECT name, cid FROM name_index WHERE scope = 'prim' ORDER BY name")?;
-    let rows = stmt.query_map([], |row| {
-        let name: String = row.get(0)?;
-        let blob: Vec<u8> = row.get(1)?;
-        Ok((name, blob))
-    })?;
-
+    let entries = db::list_names(conn, "prim", None)?;
     let mut out = Vec::new();
-    for row in rows {
-        let (name, cid_blob) = row?;
-        let cid_bytes = cid::from_slice(&cid_blob)?;
+    for entry in entries {
+        let db::NameEntry { name, cid } = entry;
+        let cid_bytes = cid;
         let info = load_prim_info(conn, &cid_bytes)?;
         let signature = format_signature(&info.params, &info.results);
         let effects = info

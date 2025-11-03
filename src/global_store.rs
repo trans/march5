@@ -9,7 +9,7 @@ use std::convert::TryFrom;
 
 use crate::cbor::{push_array, push_bytes, push_f64, push_i64, push_text, push_u32};
 use crate::interp::Value;
-use crate::{cid, store};
+use crate::{cid, db};
 
 /// Global process-local store holding immutable values keyed by namespace-qualified names.
 #[derive(Clone, Debug)]
@@ -130,13 +130,13 @@ pub fn store_snapshot(
 ) -> Result<GlobalStoreStoreOutcome> {
     let cbor = encode_snapshot(snapshot)?;
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "gstate", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "gstate", &cbor)?;
     Ok(GlobalStoreStoreOutcome { cid, inserted })
 }
 
 /// Load a persisted snapshot from the object store.
 pub fn load_snapshot(conn: &Connection, cid_bytes: &[u8; 32]) -> Result<GlobalStoreSnapshot> {
-    let (kind, cbor) = store::load_object_cbor(conn, cid_bytes)?;
+    let (kind, cbor) = db::load_object_cbor(conn, cid_bytes)?;
     if kind != "gstate" {
         bail!(
             "object {} is not a global store snapshot",
@@ -319,7 +319,7 @@ fn decode_store_value(value: &CborValue) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store;
+    use crate::db;
     use std::collections::BTreeMap;
 
     #[test]
@@ -357,7 +357,7 @@ mod tests {
     #[test]
     fn store_and_load_snapshot_from_db() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
         reset();
         write("demo.item", Value::I64(7));
         write("demo.float", Value::F64(2.5));

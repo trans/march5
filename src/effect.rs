@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::cbor::{push_map, push_text};
-use crate::{cid, store};
+use crate::{cid, db};
 
 /// Shape of an effect descriptor before encoding.
 pub struct EffectCanon<'a> {
@@ -46,7 +46,7 @@ pub fn encode(effect: &EffectCanon) -> Vec<u8> {
 pub fn store_effect(conn: &Connection, effect: &EffectCanon) -> Result<EffectStoreOutcome> {
     let cbor = encode(effect);
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "effect", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "effect", &cbor)?;
     Ok(EffectStoreOutcome { cid, inserted })
 }
 

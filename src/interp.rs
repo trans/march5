@@ -1087,10 +1087,10 @@ fn eval_primitive(conn: &Connection, prim_cid: &[u8; 32], inputs: Vec<Value>) ->
 mod tests {
     use super::*;
     use crate::builder::GraphBuilder;
+    use crate::db;
     use crate::global_store;
     use crate::node::{NodeCanon, NodeInput, NodeKind, NodePayload};
     use crate::prim::{self, PrimCanon};
-    use crate::store;
     use crate::types::{EffectDomain, TypeTag, effect_mask};
 
     fn guard_key(tag: TypeTag) -> [u8; 32] {
@@ -1103,7 +1103,7 @@ mod tests {
     #[test]
     fn run_word_supports_multi_result_literals() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[])?;
@@ -1122,7 +1122,7 @@ mod tests {
     #[test]
     fn run_word_with_multiple_tokens() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         // Create a primitive that claims IO + State effects so we emit both tokens.
         let params = [TypeTag::I64, TypeTag::I64];
@@ -1134,7 +1134,7 @@ mod tests {
             effect_mask: effect_mask::IO | effect_mask::STATE_READ,
         };
         let prim_outcome = prim::store_prim(&conn, &prim)?;
-        store::put_name(&conn, "prim", "add_i64", &prim_outcome.cid)?;
+        db::put_name(&conn, "prim", "add_i64", &prim_outcome.cid)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&params)?;
@@ -1155,7 +1155,7 @@ mod tests {
         global_store::reset();
 
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let key = [0xAA; 32];
 
@@ -1168,7 +1168,7 @@ mod tests {
             effect_mask: effect_mask::STATE_READ,
         };
         let read_outcome = prim::store_prim(&conn, &read_prim)?;
-        store::put_name(&conn, "prim", "state.read_i64", &read_outcome.cid)?;
+        db::put_name(&conn, "prim", "state.read_i64", &read_outcome.cid)?;
 
         let write_params = [TypeTag::Ptr, TypeTag::I64];
         let write_results = [TypeTag::Unit];
@@ -1179,7 +1179,7 @@ mod tests {
             effect_mask: effect_mask::STATE_WRITE,
         };
         let write_outcome = prim::store_prim(&conn, &write_prim)?;
-        store::put_name(&conn, "prim", "state.write_i64", &write_outcome.cid)?;
+        db::put_name(&conn, "prim", "state.write_i64", &write_outcome.cid)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[])?;
@@ -1206,7 +1206,7 @@ mod tests {
         global_store::reset();
 
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let key = [0xBB; 32];
 
@@ -1219,7 +1219,7 @@ mod tests {
             effect_mask: effect_mask::STATE_READ,
         };
         let read_outcome = prim::store_prim(&conn, &read_prim)?;
-        store::put_name(&conn, "prim", "state.read_f64", &read_outcome.cid)?;
+        db::put_name(&conn, "prim", "state.read_f64", &read_outcome.cid)?;
 
         let write_params = [TypeTag::Ptr, TypeTag::F64];
         let write_results = [TypeTag::Unit];
@@ -1230,7 +1230,7 @@ mod tests {
             effect_mask: effect_mask::STATE_WRITE,
         };
         let write_outcome = prim::store_prim(&conn, &write_prim)?;
-        store::put_name(&conn, "prim", "state.write_f64", &write_outcome.cid)?;
+        db::put_name(&conn, "prim", "state.write_f64", &write_outcome.cid)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[TypeTag::F64])?;
@@ -1257,7 +1257,7 @@ mod tests {
         global_store::reset();
 
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let key = [0xCC; 32];
 
@@ -1270,7 +1270,7 @@ mod tests {
             effect_mask: effect_mask::STATE_READ,
         };
         let read_outcome = prim::store_prim(&conn, &read_prim)?;
-        store::put_name(&conn, "prim", "state.read_ptr", &read_outcome.cid)?;
+        db::put_name(&conn, "prim", "state.read_ptr", &read_outcome.cid)?;
 
         let write_params = [TypeTag::Ptr, TypeTag::Ptr];
         let write_results = [TypeTag::Unit];
@@ -1281,7 +1281,7 @@ mod tests {
             effect_mask: effect_mask::STATE_WRITE,
         };
         let write_outcome = prim::store_prim(&conn, &write_prim)?;
-        store::put_name(&conn, "prim", "state.write_ptr", &write_outcome.cid)?;
+        db::put_name(&conn, "prim", "state.write_ptr", &write_outcome.cid)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[])?;
@@ -1313,7 +1313,7 @@ mod tests {
         global_store::reset();
 
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let key = [0xDD; 32];
 
@@ -1326,7 +1326,7 @@ mod tests {
             effect_mask: effect_mask::STATE_READ,
         };
         let read_outcome = prim::store_prim(&conn, &read_prim)?;
-        store::put_name(&conn, "prim", "state.read_text", &read_outcome.cid)?;
+        db::put_name(&conn, "prim", "state.read_text", &read_outcome.cid)?;
 
         let write_params = [TypeTag::Ptr, TypeTag::Text];
         let write_results = [TypeTag::Unit];
@@ -1337,7 +1337,7 @@ mod tests {
             effect_mask: effect_mask::STATE_WRITE,
         };
         let write_outcome = prim::store_prim(&conn, &write_prim)?;
-        store::put_name(&conn, "prim", "state.write_text", &write_outcome.cid)?;
+        db::put_name(&conn, "prim", "state.write_text", &write_outcome.cid)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[TypeTag::Text])?;
@@ -1363,7 +1363,7 @@ mod tests {
     #[test]
     fn guard_failure_blocks_word() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_guard(&[])?;
@@ -1383,7 +1383,7 @@ mod tests {
     #[test]
     fn guard_success_allows_word() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_guard(&[])?;
@@ -1403,7 +1403,7 @@ mod tests {
     #[test]
     fn boolean_primitives_evaluate() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let prims = [
             (
@@ -1460,7 +1460,7 @@ mod tests {
                 effect_mask: effect_mask::NONE,
             };
             let outcome = prim::store_prim(&conn, &prim)?;
-            store::put_name(&conn, "prim", name, &outcome.cid)?;
+            db::put_name(&conn, "prim", name, &outcome.cid)?;
             prim_ids.insert(tag.to_string(), outcome.cid);
         }
 
@@ -1513,7 +1513,7 @@ mod tests {
     #[test]
     fn run_word_supports_void_result() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[])?;
@@ -1527,7 +1527,7 @@ mod tests {
     #[test]
     fn run_word_guard_match_branch() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let value_node = NodeCanon {
             kind: NodeKind::Lit,
@@ -1618,7 +1618,7 @@ mod tests {
     #[test]
     fn run_word_guard_else_branch() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let value_node = NodeCanon {
             kind: NodeKind::Lit,
@@ -1709,7 +1709,7 @@ mod tests {
     #[test]
     fn run_word_guard_else_deopt() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let value_node = NodeCanon {
             kind: NodeKind::Lit,
@@ -1800,7 +1800,7 @@ mod tests {
     #[test]
     fn run_word_handles_if_true_branch() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let cond_node = NodeCanon {
             kind: NodeKind::Lit,

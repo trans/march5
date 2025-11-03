@@ -5,6 +5,7 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use serde_json;
 
+use march5::db;
 use march5::node::NodeInput;
 use march5::types::{EffectMask, effect_mask};
 use march5::{TypeTag, Value, cid, get_name, load_object_cbor};
@@ -102,34 +103,14 @@ pub(crate) fn list_scope(
     prefix: Option<&str>,
     empty_msg: &str,
 ) -> Result<()> {
-    let sql_prefix =
-        "SELECT name, cid FROM name_index WHERE scope = ?1 AND name LIKE ?2 ORDER BY name";
-    let sql_all = "SELECT name, cid FROM name_index WHERE scope = ?1 ORDER BY name";
-
-    let mut stmt = if prefix.is_some() {
-        conn.prepare(sql_prefix)?
-    } else {
-        conn.prepare(sql_all)?
-    };
-
-    let mut rows = if let Some(prefix) = prefix {
-        let pattern = format!("{prefix}%");
-        stmt.query((scope, pattern))?
-    } else {
-        stmt.query([scope])?
-    };
-
-    let mut found = false;
-    while let Some(row) = rows.next()? {
-        let name: String = row.get(0)?;
-        let cid_blob: Vec<u8> = row.get(1)?;
-        let cid = cid::from_slice(&cid_blob)?;
-        println!("{name} -> {}", cid::to_hex(&cid));
-        found = true;
+    let entries = db::list_names(conn, scope, prefix)?;
+    if entries.is_empty() {
+        println!("{empty_msg}");
+        return Ok(());
     }
 
-    if !found {
-        println!("{empty_msg}");
+    for entry in entries {
+        println!("{} -> {}", entry.name, cid::to_hex(&entry.cid));
     }
 
     Ok(())

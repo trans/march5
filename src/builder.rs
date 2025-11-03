@@ -12,10 +12,10 @@ use anyhow::{Result, anyhow, bail};
 use rusqlite::Connection;
 use smallvec::SmallVec;
 
+use crate::db;
 use crate::guard;
 use crate::node::{self, NodeCanon, NodeInput, NodeKind, NodePayload};
 use crate::prim::{self, PrimInfo};
-use crate::store;
 use crate::types::{self, EffectDomain, EffectMask, TypeTag, effect_mask};
 use crate::word::{self, WordCanon, WordInfo};
 
@@ -471,7 +471,7 @@ impl<'conn> GraphBuilder<'conn> {
         };
         let outcome = guard::store_guard(self.conn, &guard)?;
         if let Some(name) = symbol {
-            store::put_name(self.conn, "guard", name, &outcome.cid)?;
+            db::put_name(self.conn, "guard", name, &outcome.cid)?;
         }
 
         self.param_types.clear();
@@ -1059,7 +1059,7 @@ impl<'conn> GraphBuilder<'conn> {
         };
         let outcome = word::store_word(self.conn, &word)?;
         if let Some(name) = symbol {
-            store::put_name(self.conn, "word", name, &outcome.cid)?;
+            db::put_name(self.conn, "word", name, &outcome.cid)?;
         }
 
         // Leave the final results on the stack for inspection, but reset tracking.
@@ -1137,8 +1137,8 @@ impl<'conn> GraphBuilder<'conn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db;
     use crate::prim::{self, PrimCanon};
-    use crate::store;
     use crate::types::effect_mask;
     use crate::{Value, run_word};
     use serde_cbor::Value as CborValue;
@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     fn build_add_word() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let param_tags = [TypeTag::I64, TypeTag::I64];
         let result_tags = [TypeTag::I64];
@@ -1167,26 +1167,19 @@ mod tests {
 
         let word_cid = builder.finish_word(&[], &[TypeTag::I64], Some("demo/add"))?;
 
-        let stored_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM object WHERE kind = 'word'",
-            [],
-            |row| row.get(0),
-        )?;
+        let stored_count = db::count_objects_of_kind(&conn, "word")?;
         assert!(stored_count >= 1);
 
-        let registered: Vec<u8> = conn.query_row(
-            "SELECT cid FROM name_index WHERE scope = 'word' AND name = 'demo/add'",
-            [],
-            |row| row.get(0),
-        )?;
-        assert_eq!(registered.as_slice(), &word_cid);
+        let registered =
+            db::get_name(&conn, "word", "demo/add")?.expect("demo/add registered in name_index");
+        assert_eq!(registered, word_cid);
         Ok(())
     }
 
     #[test]
     fn dup_swap_over_are_wiring_only() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[])?;
@@ -1204,7 +1197,7 @@ mod tests {
     #[test]
     fn drop_nip_tuck_rot_variants() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[])?;
@@ -1260,7 +1253,7 @@ mod tests {
     #[test]
     fn finish_void_word_creates_return() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[])?;
@@ -1292,7 +1285,7 @@ mod tests {
     #[test]
     fn finish_word_preserves_result_order() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[])?;
@@ -1346,7 +1339,7 @@ mod tests {
     #[test]
     fn finish_word_tracks_effect_dependencies() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let param_tags = [TypeTag::I64, TypeTag::I64];
         let result_tags = [TypeTag::I64];
@@ -1403,7 +1396,7 @@ mod tests {
     #[test]
     fn dispatch_lowers_guard_graphs() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
 
@@ -1509,7 +1502,7 @@ mod tests {
     #[test]
     fn pair_and_unpair_roundtrip() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_word(&[])?;
@@ -1528,7 +1521,7 @@ mod tests {
     #[test]
     fn apply_quotation_invokes_target() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         // target word
         let mut builder = GraphBuilder::new(&conn);
@@ -1557,7 +1550,7 @@ mod tests {
     #[test]
     fn finish_guard_persists_boolean_guard() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        store::install_schema(&conn)?;
+        db::install_schema(&conn)?;
 
         let mut builder = GraphBuilder::new(&conn);
         builder.begin_guard(&[])?;

@@ -3,6 +3,7 @@
 pub mod builder;
 pub mod cbor;
 pub mod cid;
+pub mod db;
 pub mod effect;
 pub mod exec;
 pub mod global_store;
@@ -13,7 +14,6 @@ pub mod interp;
 pub mod namespace;
 pub mod node;
 pub mod prim;
-pub mod store;
 pub mod types;
 pub mod word;
 pub mod yaml;
@@ -21,6 +21,11 @@ pub mod yaml;
 pub type Result<T> = anyhow::Result<T>;
 
 pub use builder::{DispatchSpec, GraphBuilder};
+pub use db::{
+    NameEntry, count_objects_of_kind, create_store, derive_db_path, ensure_parent_dirs, get_name,
+    list_names, list_names_for_cid, load_all_cbor_for_kind, load_cbor_for_kind, load_object_cbor,
+    open_store, put_name,
+};
 pub use effect::{EffectCanon, EffectStoreOutcome};
 pub use global_store::{
     GlobalStore, GlobalStoreSnapshot, GlobalStoreStoreOutcome, load_snapshot, store_snapshot,
@@ -32,9 +37,5 @@ pub use interp::{Value, run_word, run_word_i64};
 pub use namespace::{NamespaceCanon, NamespaceExport, NamespaceStoreOutcome};
 pub use node::{NodeCanon, NodeInput, NodeKind, NodePayload, NodeStoreOutcome};
 pub use prim::{PrimCanon, PrimInfo, PrimStoreOutcome};
-pub use store::{
-    create_store, derive_db_path, ensure_parent_dirs, get_name, list_names_for_cid,
-    load_object_cbor, open_store, put_name,
-};
 pub use types::TypeTag;
 pub use word::{WordCanon, WordStoreOutcome};

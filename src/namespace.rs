@@ -4,7 +4,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 
 use crate::cbor::{push_array, push_bytes, push_text};
-use crate::{cid, store};
+use crate::{cid, db};
 
 /// Structured namespace before encoding.
 #[derive(Clone, Debug)]
@@ -41,7 +41,7 @@ pub fn encode(ns: &NamespaceCanon) -> Vec<u8> {
 pub fn store_namespace(conn: &Connection, ns: &NamespaceCanon) -> Result<NamespaceStoreOutcome> {
     let cbor = encode(ns);
     let cid = cid::compute(&cbor);
-    let inserted = store::put_object(conn, &cid, "namespace", &cbor)?;
+    let inserted = db::put_object(conn, &cid, "namespace", &cbor)?;
     Ok(NamespaceStoreOutcome { cid, inserted })
 }
 
